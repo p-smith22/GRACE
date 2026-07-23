@@ -1,0 +1,27 @@
+# ============================================================================
+# pyproject.toml -- GRACE package metadata:
+# ============================================================================
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grace-control"
+version = "0.1.0"
+description = "Gramian-based Reachability Analysis and Control Engine"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "scipy",
+    "casadi",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+sim = ["pygame"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["grace*"]

@@ -1,0 +1,7 @@
+numpy
+scipy
+casadi
+matplotlib
+
+[sim]
+pygame
