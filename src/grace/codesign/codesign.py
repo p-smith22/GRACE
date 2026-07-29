@@ -1,15 +1,4 @@
-# ============================================================================
-# codesign.py -- joint control-and-parameter optimization:
-# ============================================================================
-# The user names a design parameter that appears in the dynamics.  GRACE builds
-# an extra rollout that carries the endpoint's sensitivity to that parameter,
-# then alternates an inner lambda shoot (optimal control at the current design)
-# with an outer design step.  The design gradient comes free from the envelope
-# theorem: at the inner optimum only the explicit parameter dependence matters,
-# so no differentiation through the inner solve is needed.  Sweeping the design
-# weight traces a Pareto front of control effort versus design objective.
-# ============================================================================
-
+# Import packages and shooting:
 import os
 import numpy as np
 from ..shooting.bounds import safe_solve

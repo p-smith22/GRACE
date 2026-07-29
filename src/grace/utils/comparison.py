@@ -1,17 +1,6 @@
-# ============================================================================
-# comparison.py -- benchmark the shoot against the optimizer:
-# ============================================================================
-# Runs GRACE's shooting solver and the direct optimizer on the same problem,
-# times both, and collects the four comparison metrics (compute time, control
-# cost, endpoint error, stationarity).  Because both groups run on the same
-# compiled rollout, the comparison is fair and cheap.
-# ============================================================================
-
+# Import packages;
 import time
-import numpy as np
-
 from .diagnostics import diagnostics, clearance
-
 
 # Print a standardized one-line summary of a solve:
 def print_result(method, mode, cost, stationarity, endpoint_error, time_ms,
@@ -29,12 +18,11 @@ def print_result(method, mode, cost, stationarity, endpoint_error, time_ms,
     # Print the standardized line:
     print(line)
 
-
 # Compare the shoot against the optimizer on one problem:
 def compare(engine, target, obstacles=None, R=None, pos_idx=(0, 1),
             verbose=True, plot=None):
 
-    # The mode label depends on whether obstacles are present:
+    # Designate mode depending on presence of obstacle:
     mode = "obstacle" if obstacles is not None else "simple"
     system = engine.system
 
@@ -43,9 +31,9 @@ def compare(engine, target, obstacles=None, R=None, pos_idx=(0, 1),
     U = engine.shooting.lambda_shoot(target, obstacles=obstacles, R=R, pos_idx=pos_idx)
     t_shoot = (time.perf_counter() - t0) * 1e3
 
-    # Time the optimizer, warm-started from the shoot for a fair endpoint:
+    # Time the optimizer:
     t0 = time.perf_counter()
-    Uo = engine.optimizer.optimize(target, obstacles=obstacles, R=R, pos_idx=pos_idx, U0=U)
+    Uo = engine.optimizer.optimize(target, obstacles=obstacles, R=R, pos_idx=pos_idx)
     t_opt = (time.perf_counter() - t0) * 1e3
 
     # Diagnose both solutions:

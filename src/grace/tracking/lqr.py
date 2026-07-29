@@ -1,16 +1,7 @@
-# ============================================================================
-# lqr.py -- trajectory-tracking LQR gains:
-# ============================================================================
-# Linearizes the dynamics about a presolved nominal trajectory and runs the
-# backward Riccati recursion to get time-varying feedback gains K_k.  The
-# closed-loop law u = u_nom - K (z - z_nom) rejects disturbances to third order
-# while staying far cheaper than re-solving the trajectory online.
-# ============================================================================
-
+# Import package:
 import numpy as np
 
-
-# Compute time-varying LQR gains along a nominal control tape:
+# Compute time-varying LQR gains along a nominal control sequence:
 def lqr_gains(system, control, Q, R):
 
     # Roll the nominal control out to the nominal state trajectory:

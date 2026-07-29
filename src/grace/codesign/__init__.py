@@ -1,14 +1,7 @@
-# ============================================================================
-# codesign -- joint control-and-parameter optimization:
-# ============================================================================
-# Optimizes a named design parameter alongside the control, tracing a Pareto
-# front of control effort against a design objective and returning one balanced
-# control solution.
-# ============================================================================
-
+# Import codesign function:
 from .codesign import codesign as _codesign
 
-
+# Create usage class:
 class Codesign:
 
     # Bind codesign to an engine's problem definition:
@@ -30,5 +23,5 @@ class Codesign:
                          figures_dir=figures_dir, job=job, plot=plot,
                          target_idx=target_idx)
 
-
+# Name:
 __all__ = ["Codesign"]

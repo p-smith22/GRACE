@@ -1,25 +1,11 @@
-# ============================================================================
-# lambda_obstacle.py -- obstacle-avoidance shoot (feasible + minimum-effort):
-# ============================================================================
-# A three-stage pipeline that guarantees a collision-free trajectory and then
-# drives it to the minimum-effort optimum:
-#   1. Potential flow with a vortex term routes a collision-free position path
-#      around the obstacles (no stagnation, works for centred obstacles too).
-#   2. A two-phase solve tracks that path to a feasible control tape, then drives
-#      the full endpoint while a log-barrier vetoes any step that would penetrate
-#      an obstacle -- so feasibility is preserved throughout.
-#   3. A stationarity polish descends control effort in the endpoint null space
-#      (the lambda-shoot technique) with the barrier holding clearance, reaching
-#      the constrained minimum-effort optimum.
-# If the request is infeasible for the given horizon (too little time or an
-# obstacle that cannot be cleared), the solver returns the best feasible attempt
-# and sets system._obstacle_infeasible so the caller can warn the user.
-# ============================================================================
-
+# Import package:
 import numpy as np
 
-def potential_path(start,goal,OBS,R,step=0.03,maxsteps=6000):
-    p=np.array(start,float);path=[p.copy()]
+# Define potential flow path:
+def potential_path(start, goal, OBS, R, step=0.03, maxsteps=6000):
+
+    p=np.array(start,float)
+    path=[p.copy()]
     for _ in range(maxsteps):
         to_goal=goal-p;dg=np.linalg.norm(to_goal)
         if dg<step*2: break
@@ -242,5 +228,6 @@ def lambda_obstacle(system, z_target, obstacles, R, pos_idx=(0, 1), max_it=250, 
         print("[grace] warning: obstacle request appears infeasible for this horizon "
               "(clearance %.2f vs R %.2f, endpoint error %.2e). Try a longer horizon N, "
               "more time, or an easier obstacle." % (clr, R, ee))
-
+        print("[GRACE] WARNING: obstacle request appears infeasible for this horizon. "
+              "Try a longer horizon N, more time, or an easier obstacle.")
     return U

@@ -1,23 +1,16 @@
-# ============================================================================
-# simulate.py -- roll the system forward, open or closed loop:
-# ============================================================================
-# simulate is multi-use.  With no gains it plays the control tape open loop.
-# With tracking gains and a nominal it corrects deviations with feedback
-# u = u_nom - K (z - z_nom).  Disturbances are added to the state each step so
-# open-loop drift and closed-loop rejection can be compared on the same noise.
-# ============================================================================
-
+# Import package:
 import numpy as np
 
-
-# Simulate the system forward under a control tape:
+# Simulate the system forward under a control sequence (closed- or open-loop)
 def simulate(system, control, gains=None, nominal=None, disturb=None, feedback=True):
 
-    # Reshape the control tape to per-step controls:
+    # Reshape the control sequence to be (tsteps, n_controls):
     Un = np.asarray(control).reshape(system.N, system.nu)
 
     # Start from the system's initial state:
     z = system.z0.copy()
+
+    # Initialize trajectory:
     Z = [z.copy()]
 
     # Step through the horizon:

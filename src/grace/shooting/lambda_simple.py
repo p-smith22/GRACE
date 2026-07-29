@@ -1,30 +1,22 @@
-# ============================================================================
-# lambda_simple.py -- minimum-effort optimal shoot to a target:
-# ============================================================================
-# Projected-gradient descent on the control cost U^T R U confined to the
-# feasible manifold g(U) = target.  The descent direction is the reduced
-# gradient R = 2 R U + Co^T lam, reprojected onto the manifold each step.
-# Optional per-control box bounds [u_lo, u_hi] (enforced by projection) and an
-# R weighting (per-control cost weights) let some controls be favored over
-# others.  This is the simple (no-obstacle) branch of lambda_shoot.
-# ============================================================================
-
+# Import packages:
 import numpy as np
-
 from .newton import newton_shoot
 from .bounds import expand_bounds, project_box, expand_weights, weighted_cost, weighted_cost_grad, safe_solve
 
-
-# Shoot the minimum-effort control tape that reaches the target:
+# Newton shoot for optimal control sequence:
 def lambda_simple(system, z_target, U0=None, max_it=60, ftol=1e-2, tr0=0.3, reg=1e-8,
                   u_lo=None, u_hi=None, R_weights=None):
 
-    # Reduce the target and warm-start from a feasible (box-projected) Newton shot:
+    # Only focus on constrained states (i.e., ones we are focusing on for endpoint):
     zt = system.target(z_target)
+
+    # Extract number of constriained states:
     m = system.m
+
+    # Newton shoot for feasible control sequence:
     U = newton_shoot(system, zt, U0, u_lo=u_lo, u_hi=u_hi)
 
-    # Expand optional per-control box bounds and R cost weights:
+    # Expand bounds to full trajectory, build weight matrix:
     lo, hi = expand_bounds(u_lo, u_hi, system.N, system.nu)
     r_diag = expand_weights(R_weights, system.N, system.nu)
 
@@ -32,14 +24,16 @@ def lambda_simple(system, z_target, U0=None, max_it=60, ftol=1e-2, tr0=0.3, reg=
     c = weighted_cost(U, r_diag)
     tr = tr0
 
-    # Descend the weighted control cost within the feasible manifold:
+    # Begin lambda shoot was max iterations:
     for _ in range(max_it):
 
-        # Evaluate the endpoint Jacobian and controllability Gramian:
+        # Evaluate the endpoint and its Jacbian:
         e, Co = system.endpoint_jac(U)
+
+        # Construct the controllability matrix:
         W = Co @ Co.T + reg * np.eye(m)
 
-        # Form the reduced gradient of the weighted cost on the manifold:
+        # Compute residual on Lagrange multiplier:
         gc = weighted_cost_grad(U, r_diag)
         lam = safe_solve(W, -Co @ gc)
         R = gc + Co.T @ lam
@@ -48,24 +42,22 @@ def lambda_simple(system, z_target, U0=None, max_it=60, ftol=1e-2, tr0=0.3, reg=
         if np.linalg.norm(R) / max(np.linalg.norm(gc), 1e-9) < ftol:
             break
 
-        # Descend along the tangent (nullspace) direction:
+        # Compute descent direction (steepest descent, normalized):
         d = -R / np.linalg.norm(R)
+
+        # Compute controls that need to be adjusted:
         d = d - Co.T @ safe_solve(W, Co @ d)
+
+        # Adjust control:
         Ut = U + tr * np.linalg.norm(U) * d
 
-        # Project the trial step into the box:
+        # Project the trial step into the box constraints:
         Ut = project_box(Ut, lo, hi)
 
-        # Reproject the trial step back onto the feasible manifold (staying in the box):
-        for _ in range(3):
-            rr = system.endpoint(Ut) - zt
-            if np.linalg.norm(rr) < 1e-3:
-                break
-            _, Jt = system.endpoint_jac(Ut)
-            Ut = Ut - Jt.T @ safe_solve(Jt @ Jt.T + reg * np.eye(m), rr)
-            Ut = project_box(Ut, lo, hi)
+        # Recover feasibility in the endpoint via newton shoot methodology (intermediate:
+        newton_shoot(system, zt, Ut, u_lo=u_lo, u_hi=u_hi, it=3, tol=1e-3)
 
-        # Accept the step if it lowers the weighted cost and stays feasible:
+        # Ensure new step lowers cost and is feasible:
         ct = weighted_cost(Ut, r_diag)
         if ct < c and np.linalg.norm(system.endpoint(Ut) - zt) < 5e-3:
             U = Ut
@@ -80,15 +72,15 @@ def lambda_simple(system, z_target, U0=None, max_it=60, ftol=1e-2, tr0=0.3, reg=
         if tr < 1e-4:
             break
 
-    # Clean up feasibility and return the optimal control tape:
+    # Clean up feasibility:
     U = newton_shoot(system, zt, U, u_lo=u_lo, u_hi=u_hi)
 
-    # Flag if the endpoint could not be reached -- an impossible target for this horizon
-    # (too little time) or an underactuated system that cannot hit every target state:
+    # Flag if the endpoint could not be reached:
     ee = np.linalg.norm(system.endpoint(U) - zt)
     system._infeasible = bool(ee > 1e-2)
     if system._infeasible:
-        print("[grace] warning: target does not appear reachable for this horizon "
-              "(endpoint error %.2e). Try a longer horizon N, more time, or a closer target." % ee)
+        print("[GRACE] WARNING: target does not appear reachable. "
+              "Try a longer horizon N, more time, or a closer target.")
 
+    # Return control:
     return U

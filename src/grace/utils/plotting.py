@@ -1,22 +1,14 @@
-# ============================================================================
-# plotting.py -- the standard GRACE plots:
-# ============================================================================
-# One state-and-control subplot grid (each state and control in its own panel,
-# an optional trajectory panel with obstacles), a closed-loop overlay, and the
-# four-metric comparison panel used against the optimizer.  Every state and
-# control gets its own axis and shares the time axis so panels line up.
-# ============================================================================
-
+# Import packages:
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Set settings:
+matplotlib.use("Agg")
 
 # State and control colors for a consistent look:
 STATE_COLOR = "#2c6fbb"
 CONTROL_COLOR = "#c0392b"
-
 
 # Plot a trajectory, its states, and its controls as individual subplots:
 def plotting(system, trajectory, control, dt=None, obstacles=None, R=None,

@@ -1,39 +1,34 @@
-# ============================================================================
-# newton.py -- Newton feasibility shoot:
-# ============================================================================
-# Drives the endpoint map g(U) onto a target by Gauss-Newton steps on the
-# least-norm correction dU = Co^T (Co Co^T)^-1 r.  This reaches a feasible
-# trajectory but does not minimize control effort -- that is lambda_shoot.
-# ============================================================================
-
+# Import necessary packages:
 import numpy as np
-
 from .bounds import expand_bounds, project_box, safe_solve
 
+# Newton shoot function:
+def newton_shoot(system, z_target, U0=None, it=25, reg=1e-8, tol=1e-9, u_lo=None, u_hi=None):
 
-# Shoot the control tape so the endpoint reaches the target:
-def newton_shoot(system, z_target, U0=None, it=25, reg=1e-8, u_lo=None, u_hi=None):
-
-    # Reduce the target to the constrained endpoint components:
+    # Only pull constrained states:
     zt = system.target(z_target)
+
+    # Define number of constrained states:
     m = system.m
 
-    # Expand optional per-control box bounds to the full tape:
+    # Stretch bounds to entire timespan:
     lo, hi = expand_bounds(u_lo, u_hi, system.N, system.nu)
 
-    # Start from zero controls or a provided warm start, projected into the box:
+    # Use provided warmstart or defualt to zeros if none is given:
     U = np.zeros(system.N * system.nu) if U0 is None else np.asarray(U0).flatten().copy()
+
+    # Ensure controls fit within bounds, clip if not:
     U = project_box(U, lo, hi)
 
-    # Take Gauss-Newton steps on the least-norm feasibility correction:
+    # Attempt to converge endpoint with a max number of iterations:
     for _ in range(it):
 
         # Evaluate the endpoint residual and its Jacobian:
         e, J = system.endpoint_jac(U)
         r = e - zt
 
-        # Stop once the endpoint is reached:
-        if np.linalg.norm(r) < 1e-9:
+        # Stop once the endpoint residual is low enough:
+        if np.linalg.norm(r) < tol:
             break
 
         # Apply the least-norm correction, projected back into the box:

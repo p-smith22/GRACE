@@ -1,24 +1,18 @@
-# ============================================================================
-# reachability -- controllability and reachability analysis:
-# ============================================================================
-# Extracts the structure of the controllability Gramian so a system can be
-# benchmarked for how controllable it is and where its weak directions lie.
-# ============================================================================
-
+# Import analysis functions:
 from . import analysis
 
-
+# Reachability class:
 class Reachability:
 
     # Bind the reachability tools to a system:
     def __init__(self, system):
         self.system = system
 
-    # Controllability Gramian at a control tape:
+    # Controllability Gramian at a given control::
     def gramian(self, control, reg=0.0):
         return analysis.gramian(self.system, control, reg=reg)
 
-    # Eigenvalues and eigenvectors of the Gramian (strong to weak):
+    # Eigenvalues and eigenvectors of the Gramian (strongest to weakest):
     def eig(self, control):
         return analysis.eig(self.system, control)
 
@@ -34,10 +28,6 @@ class Reachability:
     def condition_number(self, control):
         return analysis.condition_number(self.system, control)
 
-    # Scalar controllability measures:
-    def measures(self, control):
-        return analysis.measures(self.system, control)
-
     # Full controllability report:
     def summary(self, control):
         return analysis.summary(self.system, control)
@@ -46,5 +36,5 @@ class Reachability:
     def print_summary(self, control, name="system"):
         return analysis.print_summary(self.system, control, name=name)
 
-
+# Name:
 __all__ = ["Reachability"]

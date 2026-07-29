@@ -1,36 +1,36 @@
-# ============================================================================
-# diagnostics.py -- how optimal and how feasible a control tape is:
-# ============================================================================
-# The stationarity residual is the KKT condition of the minimum-effort shoot:
-# ||2U + Co^T lam|| / ||2U||.  It is zero at an optimal control, so it measures
-# how far a solution is from optimal without needing a reference optimizer.
-# ============================================================================
-
+# Import package:
 import numpy as np
 
 
 # Compute the stationarity residual of a control tape:
 def stationarity(system, U, reg=1e-8):
 
-    # Evaluate the endpoint Jacobian and controllability Gramian:
+    # Reshape control:
     U = np.asarray(U).flatten()
+
+    # Evaluate the endpoint Jacobian:
     _, Co = system.endpoint_jac(U)
+
+    # Compute Gramian:
     W = Co @ Co.T + reg * np.eye(system.m)
 
-    # Form the reduced gradient of the cost on the feasible manifold:
+    # Compute Lagrange multiplier residual:
     lam = np.linalg.solve(W, -Co @ (2 * U))
     R = 2 * U + Co.T @ lam
 
-    # Return the normalized KKT residual:
+    # Return normalized residual:
     return float(np.linalg.norm(R) / max(np.linalg.norm(2 * U), 1e-9))
-
 
 # Compute cost, endpoint error, and stationarity for a control tape:
 def diagnostics(system, U, target):
 
-    # Reduce the target and evaluate the endpoint:
+    # Reshape control:
     U = np.asarray(U).flatten()
+
+    # Only focus on constrained endpoints:
     zt = system.target(target)
+
+    # Compute endpoint:
     e = system.endpoint(U)
 
     # Return the three solution metrics:
@@ -39,11 +39,13 @@ def diagnostics(system, U, target):
                 stationarity=stationarity(system, U))
 
 
-# Compute the minimum obstacle clearance of a control tape:
+# Compute the minimum obstacle clearance of a control sequence:
 def clearance(system, U, obstacles, R, pos_idx=(0, 1)):
 
-    # Position trajectory and its distance to each obstacle:
+    # Rollout trajectory of relevant states:
     p = system.rollout(U)[:, list(pos_idx)]
+
+    # Package obstacles:
     OBS = [np.asarray(o, float) for o in obstacles]
 
     # Return the smallest clearance across all obstacles and nodes:

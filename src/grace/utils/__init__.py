@@ -1,17 +1,10 @@
-# ============================================================================
-# utils -- the supporting tools:
-# ============================================================================
-# Closed-loop simulation, plotting, optimality diagnostics, and the shoot-vs-
-# optimizer comparison.  These are the utilities the engine exposes through
-# engine.utils.
-# ============================================================================
-
+# Import utility functions:
 from . import diagnostics as _diagnostics
 from . import simulate as _simulate
 from . import plotting as _plotting
 from . import comparison as _comparison
 
-
+# Utils class:
 class Utils:
 
     # Bind the utilities to an engine:
@@ -19,7 +12,7 @@ class Utils:
         self.engine = engine
         self.system = engine.system
 
-    # Simulate the closed-loop or open-loop system:
+    # Simulate the closed-loop (LQR tracking) or open-loop system:
     def simulate(self, control, gains=None, nominal=None, disturb=None, feedback=True):
         return _simulate.simulate(self.system, control, gains=gains, nominal=nominal,
                                   disturb=disturb, feedback=feedback)
@@ -64,5 +57,5 @@ class Utils:
         return _comparison.print_result(method, mode, cost, stationarity,
                                         endpoint_error, time_ms, clearance_val)
 
-
+# Name:
 __all__ = ["Utils"]

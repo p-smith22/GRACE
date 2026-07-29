@@ -1,16 +1,7 @@
-# ============================================================================
-# cache.py -- save and reload compiled rollout graphs by job name:
-# ============================================================================
-# Compiling the CasADi functions is the slow part of building a System.  To
-# avoid paying it on every run, a compiled System is serialized to the data
-# directory under a job name (for example "cart_pole").  Later runs with the
-# same job name reload the compiled graph instead of rebuilding it.
-# ============================================================================
-
+# Import packages:
 import os
 import numpy as np
 import casadi as ca
-
 from .system import System, build, DATA_DIR
 
 
@@ -19,7 +10,6 @@ def _job_dir(job, data_dir):
 
     # Each job gets its own subdirectory under the data directory:
     return os.path.join(data_dir, job)
-
 
 # Check whether a compiled graph already exists for a job:
 def has_cache(job, data_dir=DATA_DIR):
@@ -35,7 +25,6 @@ def has_cache(job, data_dir=DATA_DIR):
         return "graph_version" in m.files and int(m["graph_version"]) >= 2
     except Exception:
         return False
-
 
 # Save a compiled System's graph to the data directory:
 def save(system, data_dir=DATA_DIR):
@@ -64,7 +53,6 @@ def save(system, data_dir=DATA_DIR):
 
     # Return the directory the graph was written to:
     return d
-
 
 # Load a compiled System's graph from the data directory:
 def load(job, data_dir=DATA_DIR):
@@ -132,7 +120,6 @@ def load(job, data_dir=DATA_DIR):
                   pos_jac=pos_jac, job=job)
     reloaded.step_jac_all = step_jac_all
     return reloaded
-
 
 # Build a System, using the cache when possible:
 def build_cached(dynamics, nx, nu, N, z0, dt, job, target_idx=None, pos_idx=None,

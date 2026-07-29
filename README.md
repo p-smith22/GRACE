@@ -51,25 +51,6 @@ trajectory, applied = engine.utils.simulate(control, gains=gains, nominal=nomina
 engine.utils.plotting(trajectory, control)
 ```
 
-## Package layout
-
-```
-grace/
-  src/grace/
-    core          system build + graph caching
-    shooting      newton_shoot, lambda_shoot (simple and obstacle modes)
-    optimizer     reference direct optimizer
-    tracking      LQR tracking gains
-    reachability  controllability analysis
-    codesign      joint control-and-parameter optimization
-    utils         simulate, plotting, diagnostics, comparison
-  tests/          standalone verification suite (python -m tests.test_benchmarks)
-  examples/       runnable usage examples
-  docs/           documentation
-  data/           cached compiled graphs, keyed by job name
-  figures/        generated figures
-```
-
 ## Documentation
 
 See `docs/` for per-module documentation, or start with `docs/getting_started.md`.
