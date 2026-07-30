@@ -11,7 +11,7 @@ analysis, and joint control-and-parameter codesign.
 ## Install
 
 ```bash
-git clone https://github.com/<username>/grace.git
+git clone https://github.com/p-smith22/grace.git
 cd grace
 pip install -e .
 ```
