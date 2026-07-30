@@ -1,15 +1,7 @@
-# ============================================================================
-# test_reachability.py -- verify the reachability analysis:
-# ============================================================================
-# The Gramian must be symmetric, its eigenvalues sorted and nonnegative, and
-# the derived measures self-consistent.
-# ============================================================================
-
+# Import packages:
 import numpy as np
-
 import grace
 from tests.systems import double_integrator
-
 
 # Verify reachability metrics and return pass/fail records:
 def run():
@@ -36,7 +28,6 @@ def run():
 
     # Return the records:
     return results
-
 
 # Run standalone:
 if __name__ == "__main__":

@@ -1,15 +1,7 @@
-# ============================================================================
-# test_obstacles.py -- verify obstacle-avoidance shooting:
-# ============================================================================
-# The obstacle shoot must clear multiple obstacles at different locations by
-# the shared safe radius while reaching the target.
-# ============================================================================
-
+# Import packages:
 import numpy as np
-
 import grace
 from tests.systems import double_integrator
-
 
 # Verify multi-obstacle avoidance and return pass/fail records:
 def run():
@@ -35,7 +27,6 @@ def run():
 
     # Return the records:
     return results
-
 
 # Run standalone:
 if __name__ == "__main__":

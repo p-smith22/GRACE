@@ -1,15 +1,7 @@
-# ============================================================================
-# test_lambda.py -- verify minimum-effort lambda shooting:
-# ============================================================================
-# Lambda shoot must be feasible, cost no more than Newton, and its analytic
-# Jacobian must match a finite-difference rollout (linearization correctness).
-# ============================================================================
-
+# Import packages:
 import numpy as np
-
 import grace
 from tests.systems import cart_pole
-
 
 # Verify lambda shoot optimality and linearization, return pass/fail records:
 def run():
@@ -38,7 +30,6 @@ def run():
 
     # Return the records:
     return results
-
 
 # Run standalone:
 if __name__ == "__main__":

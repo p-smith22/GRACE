@@ -1,15 +1,7 @@
-# ============================================================================
-# test_lqr.py -- verify closed-loop LQR tracking:
-# ============================================================================
-# The tracked nominal must be exact with no disturbance, and feedback must
-# reduce endpoint deviation under a disturbance.
-# ============================================================================
-
+# Import packages:
 import numpy as np
-
 import grace
 from tests.systems import double_integrator
-
 
 # Verify tracking exactness and disturbance rejection, return pass/fail records:
 def run():
@@ -42,7 +34,6 @@ def run():
 
     # Return the records:
     return results
-
 
 # Run standalone:
 if __name__ == "__main__":

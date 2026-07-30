@@ -1,15 +1,7 @@
-# ============================================================================
-# test_codesign.py -- verify joint control-and-parameter codesign:
-# ============================================================================
-# Codesign must trace a Pareto front that spreads across the parameter bounds
-# and return a control at a design inside those bounds.
-# ============================================================================
-
+# Import packages:
 import numpy as np
 import casadi as ca
-
 from grace import Codesign
-
 
 # Verify codesign and return pass/fail records:
 def run():
@@ -44,7 +36,6 @@ def run():
 
     # Return the records:
     return results
-
 
 # Run standalone:
 if __name__ == "__main__":

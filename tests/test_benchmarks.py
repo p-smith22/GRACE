@@ -1,14 +1,4 @@
-# ============================================================================
-# test_benchmarks.py -- run every GRACE test and print a summary:
-# ============================================================================
-# Standalone verification of the whole package.  Run this to confirm every
-# solver group behaves as expected:
-#
-#     python -m tests.test_benchmarks
-#
-# Each test module exposes run() returning a list of (name, passed, detail).
-# ============================================================================
-
+# Import packages:
 import importlib
 
 
@@ -22,7 +12,6 @@ TESTS = [
     ("optimizer", "tests.test_optimizer"),
     ("codesign", "tests.test_codesign"),
 ]
-
 
 # Run every test module and print the results:
 def main():

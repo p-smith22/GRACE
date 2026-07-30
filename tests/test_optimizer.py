@@ -1,15 +1,7 @@
-# ============================================================================
-# test_optimizer.py -- verify the reference optimizer:
-# ============================================================================
-# The direct optimizer must reach the target and match the shoot's cost on a
-# simple problem, since both minimize the same effort objective.
-# ============================================================================
-
+# Import packages:
 import numpy as np
-
 import grace
 from tests.systems import double_integrator
-
 
 # Verify the optimizer and return pass/fail records:
 def run():
@@ -32,7 +24,6 @@ def run():
 
     # Return the records:
     return results
-
 
 # Run standalone:
 if __name__ == "__main__":

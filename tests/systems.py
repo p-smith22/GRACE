@@ -1,15 +1,7 @@
-# ============================================================================
-# systems.py -- small verified systems the benchmarks run on:
-# ============================================================================
-# Easy, well-understood systems so a benchmark failure points at the solver,
-# not the model.  These are not meant to be fast, just correct and repeatable.
-# ============================================================================
-
+# Import packages:
 import numpy as np
 import casadi as ca
-
 import grace
-
 
 # A 2D double integrator (linear, four states, two controls):
 def double_integrator(N=80, T=8.0):
@@ -20,7 +12,6 @@ def double_integrator(N=80, T=8.0):
 
     # Build the system with position indices for obstacle avoidance:
     return grace.build(dynamics, 4, 2, N, [0, 0, 0, 0.0], T / N, pos_idx=(0, 1))
-
 
 # A cart-pole (nonlinear, four states, one control):
 def cart_pole(N=40, T=2.0):

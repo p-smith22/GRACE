@@ -1,14 +1,7 @@
-# ============================================================================
-# test_newton.py -- verify Newton feasibility shooting:
-# ============================================================================
-# Newton shoot must drive the endpoint onto a reachable target.
-# ============================================================================
-
+# Import packages:
 import numpy as np
-
 import grace
 from tests.systems import cart_pole
-
 
 # Verify Newton reaches a reachable target and return pass/fail records:
 def run():
@@ -27,7 +20,6 @@ def run():
 
     # Return the records:
     return results
-
 
 # Run standalone:
 if __name__ == "__main__":
