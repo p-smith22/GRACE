@@ -30,7 +30,7 @@ def main():
     engine = grace.GRACE(system)
 
     # Define target (pole starts hanging at 0 and finishes upright at pi):
-    target = np.array([4.0, np.pi, 0.0, 0.0])
+    target = np.array([5.0, np.pi, 0.0, 0.0])
 
     # Generate control to target state:
     U = engine.shooting.lambda_shoot(target)

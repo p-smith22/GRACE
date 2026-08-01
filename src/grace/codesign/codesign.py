@@ -4,7 +4,7 @@ import numpy as np
 from ..shooting.bounds import safe_solve
 import casadi as ca
 
-from ..shooting.lambda_simple import lambda_simple
+from ..shooting.lambda_shoot import lambda_shoot
 from ..core.system import build as build_system
 
 
@@ -93,7 +93,7 @@ class _PinnedSystem:
 
 # Run codesign over a named design parameter:
 def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
-             p0, p_bounds, weights=None, substeps=1, figures_dir="figures",
+             p0, p_bounds, weights=None, substeps=1, save="figures",
              job="codesign", plot=True, target_idx=None):
 
     # dynamics here takes (x, u, p): the design parameter appears explicitly.
@@ -125,7 +125,7 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
 
             # Inner solve -- optimal control at the current design:
             sysp = _PinnedSystem(fam, nx, nu, N, z0, dt, p)
-            U = lambda_simple(sysp, zt, U0=U)
+            U = lambda_shoot(sysp, zt, U0=U)
 
             # Total design gradient at p: control-cost sensitivity (envelope theorem)
             # plus the weighted design objective.  Evaluated by a helper so we can also
@@ -134,7 +134,7 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
             # a bound, which is what a plain gradient step does):
             def design_grad(pv):
                 sp = _PinnedSystem(fam, nx, nu, N, z0, dt, pv)
-                Uv = lambda_simple(sp, zt, U0=U)
+                Uv = lambda_shoot(sp, zt, U0=U)
                 _, Cov = sp.endpoint_jac(Uv)
                 Wv = Cov @ Cov.T + 1e-6 * np.eye(sp.m)
                 lamv = safe_solve(Wv, -Cov @ (2 * Uv))
@@ -175,22 +175,19 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
 
     # Plot the Pareto front to the figures directory:
     if plot:
-        _plot_front(front, figures_dir, job)
+        _plot_front(front, save, job)
 
     # Return the selected control and the full front:
     return pick["control"], pick["param"], front
 
 
 # Plot a Pareto front of control effort versus design objective:
-def _plot_front(front, figures_dir, job):
+def _plot_front(front, save, job):
 
     # Import plotting locally so the package does not require it at import time:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
-    # Ensure the figures directory exists:
-    os.makedirs(figures_dir, exist_ok=True)
 
     # Plot control cost against design objective across the front:
     costs = [f["cost"] for f in front]
@@ -206,6 +203,5 @@ def _plot_front(front, figures_dir, job):
     fig.tight_layout()
 
     # Save the figure:
-    path = os.path.join(figures_dir, f"{job}_pareto.png")
-    fig.savefig(path, dpi=110, bbox_inches="tight")
-    return path
+    fig.savefig(save, dpi=110, bbox_inches="tight")
+    return save

@@ -15,12 +15,12 @@ class Codesign:
 
     # Optimize a named design parameter against a design objective:
     def optimize(self, target, param_name, objective, p0, p_bounds,
-                 weights=None, substeps=1, figures_dir="figures",
+                 weights=None, substeps=1, save="figures/codesign.png",
                  job="codesign", plot=True, target_idx=None):
         return _codesign(self.dynamics, self.nx, self.nu, self.N, self.z0,
                          self.dt, target, param_name, objective, p0, p_bounds,
                          weights=weights, substeps=substeps,
-                         figures_dir=figures_dir, job=job, plot=plot,
+                         save=save, job=job, plot=plot,
                          target_idx=target_idx)
 
 # Name:

@@ -18,7 +18,7 @@ def main():
     os.makedirs(f"figures/{job_name}", exist_ok=True)
 
     # Define length of trajectory:
-    N, dt = 80, 0.2
+    N, dt = 150, 0.2
 
     # Build system and GRACE engine, cached:
     system = grace.build_cached(
@@ -28,9 +28,9 @@ def main():
     engine = grace.GRACE(system)
 
     # Define target and obstacles:
-    target = np.array([10.0, 0.0, 0.0, 0.0])
-    obstacle = [[5.0, 0.0]]
-    R = 1.5
+    target = np.array([45.0, 0.0, 0.0, 0.0])
+    obstacle = [[15.0, 1.0], [30.0, -1.0]]
+    R = 4.0
 
     # Lambda shoot for obstacle avoidance:
     U = engine.shooting.lambda_shoot(target, obstacles=obstacle, R=R,

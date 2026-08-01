@@ -2,7 +2,7 @@
 import numpy as np
 
 # Compute time-varying LQR gains along a nominal control sequence:
-def lqr_gains(system, control, Q, R):
+def lqr_gains(system, control, Q, R, Qf=None):
 
     # Roll the nominal control out to the nominal state trajectory:
     Z = system.rollout(control)
@@ -12,8 +12,14 @@ def lqr_gains(system, control, Q, R):
     Q = np.array(Q, float)
     R = np.array(R, float)
 
+    # Terminal weight.  Leaving it as Q says the horizon simply stops, which
+    # lets the gains decay to nothing over the last few steps and the endpoint
+    # drift.  Raising it buys endpoint accuracy at the cost of larger terminal
+    # gains, and past roughly 1e3 * Q those gains destabilize the tracking:
+    Qf = Q.copy() if Qf is None else np.array(Qf, float)
+
     # Initialize the terminal cost-to-go and gain list:
-    P = Q.copy()
+    P = Qf.copy()
     gains = [None] * system.N
 
     # Run the backward Riccati recursion along the trajectory:

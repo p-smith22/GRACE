@@ -50,11 +50,12 @@ def main():
 
     # === LQR TRACKING DEMO ===
     # Define weights:
-    Q = np.diag([10, 10, 1, 1, 1, 1.0])
-    R = np.eye(2)
+    Q = np.diag([200, 200, 20, 20, 5, 5])
+    R = 0.01 * np.eye(2)
+    Qf = 1000000 * Q
 
     # Fetch gains:
-    gains, Z_nom = engine.tracking.lqr_gains(U, Q, R)
+    gains, Z_nom = engine.tracking.lqr_gains(U, Q, R, Qf)
 
     # Plot with disturbance:
     rng = np.random.default_rng(0)
@@ -71,8 +72,8 @@ def main():
     codesign = grace.Codesign(quadrotor_p, nx=6, nu=2, N=N, z0=[0, 0, 0, 0, 0, 0], dt=0.05)
     U_cd, p_opt, front = codesign.optimize(
         target=target, param_name="p", objective=lambda p: 2000.0 * (p - 1.0) ** 2,
-        p0=1.0, p_bounds=(0.5, 2.0), weights=np.linspace(0, 3, 6), plot=False,
-    )
+        p0=1.0, p_bounds=(0.5, 2.0), weights=np.linspace(0, 3, 6),
+        save=f'figures/{job_name}/codesign.png')
 
     # Print optimal thrust gain:
     gains_swept = [round(fp["param"], 2) for fp in front]
@@ -80,8 +81,9 @@ def main():
 
     # === OBSTACLE AVIODANCE ===
     # Define obstacle:
-    obstacles = [[2.0, 0]]
-    R_obs = 0.7
+    obstacles = [[4.0, 0]]
+    R_obs = 3
+    target = np.array([8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     # Find optimal control and trajectory:
     U_obs = engine.shooting.lambda_shoot(target, obstacles=obstacles, R=R_obs)

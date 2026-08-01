@@ -9,8 +9,8 @@ class Tracking:
         self.system = system
 
     # LQR gains computation:
-    def lqr_gains(self, control, Q, R):
-        return _lqr_gains(self.system, control, Q, R)
+    def lqr_gains(self, control, Q, R, Qf=None):
+        return _lqr_gains(self.system, control, Q, R, Qf)
 
 # Name:
 __all__ = ["Tracking"]

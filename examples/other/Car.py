@@ -65,7 +65,7 @@ def main():
     # === OBSTACLE AVOIDANCE ===
     # Define obstacle:
     obstacles = [[16.0, 0.0]]
-    R_obs = 4.5
+    R_obs = 6.0
 
     # Find optimal trajectory to avoid obstacle:
     U_obs = engine.shooting.lambda_shoot(target, obstacles=obstacles, R=R_obs,
