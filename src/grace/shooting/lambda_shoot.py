@@ -61,7 +61,11 @@ def outward_normal(foot, o, p, k, R):
     if dist >= 1e-6 * max(R, 1.0):
         return radial / dist
 
-    # Helps break symmetry saddle point:
+    # When the path runs essentially through the centre the outward normal is
+    # undefined and the penalty has no lateral component to push on, so the
+    # iterate cannot pick a side.  That is a symmetric saddle, not an optimum,
+    # and it is broken deterministically with the perpendicular to the local
+    # direction of travel, which is where the trajectory can actually move:
     k_seg = max(k, 1)
     travel = p[k_seg] - p[k_seg - 1]
     travel_norm = np.linalg.norm(travel)
@@ -75,7 +79,7 @@ def outward_normal(foot, o, p, k, R):
     return np.array([-travel[1], travel[0]]) / travel_norm
 
 # Roll out and evaluate the obstacle penalty at the current control:
-def augmented_lagrange(system, U, OBS, radii, mu, rho, tidx, zt):
+def augmented_lagrange(system, U, OBS, radii, mu, rho, tidx, zt, planes=None):
 
     # Fetch trajectory:
     Z = np.asarray(system.rollout(U))
@@ -88,12 +92,16 @@ def augmented_lagrange(system, U, OBS, radii, mu, rho, tidx, zt):
     worst_viol = -np.inf
     for i, o in enumerate(OBS):
 
+        # Each obstacle is a cylinder infinite along one axis, so it is measured
+        # only in the two position columns that span its cross section:
+        cols = list(range(len(system.pos_idx))) if planes is None else list(planes[i])
+
         # Compute violations:
-        d, _ = segment_distances(obs_pos, o)
+        d, _ = segment_distances(obs_pos[:, cols], o)
         h = radii[i] - d
         worst_viol = max(worst_viol, float(h.max()))
 
-        # Shifted multiplier - the current estimate of the Lagrange multiplier on
+        # Shifted multiplier: the current estimate of the Lagrange multiplier on
         # this constraint, which is zero wherever the constraint is inactive:
         lam_obs = np.maximum(0.0, mu[i] + rho * h)
 
@@ -104,14 +112,19 @@ def augmented_lagrange(system, U, OBS, radii, mu, rho, tidx, zt):
     return Z, obs_pos, penalty, worst_viol, np.linalg.norm(Z[-1][tidx] - zt)
 
 # Assemble the augmented-Lagrangian gradient and the active constraint rows:
-def augmented_lagrange_grad(system, p, Jp, OBS, radii, mu, rho, g, n_dof):
+def augmented_lagrange_grad(system, p, Jp, OBS, radii, mu, rho, g, n_dof, planes=None):
 
-    # Initialize list and loop through obstacles:
-    con_rows = []
+    # Rows of the constraint gradient, stacked into G as in the paper:
+    G = []
     for i, o in enumerate(OBS):
 
+        # Restrict to this cylinder's cross-section plane:
+        cols = list(range(p.shape[1])) if planes is None else list(planes[i])
+        p_i = p[:, cols]
+        Jp_i = Jp[:, cols, :]
+
         # Compute violations and the shifted multipliers they produce:
-        d, t_seg = segment_distances(p, o)
+        d, t_seg = segment_distances(p_i, o)
         lam_obs = np.maximum(0.0, mu[i] + rho * (radii[i] - d))
         active = np.where(lam_obs > 0.0)[0]
 
@@ -128,31 +141,36 @@ def augmented_lagrange_grad(system, p, Jp, OBS, radii, mu, rho, g, n_dof):
 
             # If violation is not on segment, just use k-th information:
             if k == 0 or t_seg[k] <= 0.0:
-                jac_foot[j] = Jp[k]
-                foot = p[k]
+                jac_foot[j] = Jp_i[k]
+                foot = p_i[k]
 
             # If violation lies on segment between two nodes:
             else:
 
                 # Compute adjusted information using the data from the two segment nodes:
                 w = t_seg[k]
-                jac_foot[j] = (1.0 - w) * Jp[k - 1] + w * Jp[k]
-                foot = (1.0 - w) * p[k - 1] + w * p[k]
+                jac_foot[j] = (1.0 - w) * Jp_i[k - 1] + w * Jp_i[k]
+                foot = (1.0 - w) * p_i[k - 1] + w * p_i[k]
 
             # Direction the constraint pushes at that point:
-            normals[j] = outward_normal(foot, o, p, k, radii[i])
+            normals[j] = outward_normal(foot, o, p_i, k, radii[i])
 
         # Rows of the constraint gradient, and their contribution to the cost:
         grad_h = -np.einsum('kj,kjd->kd', normals, jac_foot)
         g += lam_obs[active] @ grad_h
-        con_rows.append(grad_h)
+        G.append(grad_h)
 
     # Return the augmented gradient and the stacked active constraint rows:
-    return g, (np.vstack(con_rows) if con_rows else np.zeros((0, n_dof)))
+    return g, (np.vstack(G) if G else np.zeros((0, n_dof)))
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
 
 # Minimum-effort shoot to a target, optionally avoiding circular obstacles:
 def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
-                 u_lo=None, u_hi=None, R_weights=None, max_it=1200, ftol=1e-6,
+                 planes=None, u_lo=None, u_hi=None, R_weights=None, max_it=1200, ftol=1e-6,
                  rho0=10.0, outer=25, inner=60, tol_c=1e-3, jac_reuse=5,
                  depth=8, reg=1e-10):
 
@@ -168,11 +186,12 @@ def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
     lo, hi = expand_bounds(u_lo, u_hi, system.N, system.nu)
     r_diag = expand_weights(R_weights, system.N, system.nu)
 
-    # Hessian of the effort term and its inverse.  With no weighting this is
-    # twice the identity and every expression below collapses to the plain
-    # Gramian form:
-    hess = 2.0 * r_diag
-    hess_inv = 1.0 / hess
+    # Stacked control weight R_N of the paper, and its inverse.  The factor of
+    # two is the one carried by the gradient of U' R_N U and cancels out of the
+    # final step, so with R_weights unset every expression below collapses to
+    # the plain minimum-energy form of Section 4.2:
+    R_N = 2.0 * r_diag
+    R_N_inv = 1.0 / R_N
 
     # Gather obstacle geometry.  With none, the loop below is exactly the
     # unconstrained lambda shoot:
@@ -227,50 +246,57 @@ def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
 
             # Roll out and evaluate the penalty at the current control:
             Z, p, penalty, worst_viol, _ = augmented_lagrange(
-                system, U, OBS, radii, mu, rho, tidx, zt)
+                system, U, OBS, radii, mu, rho, tidx, zt, planes)
             if not np.all(np.isfinite(Z)):
                 U = U_best
                 break
 
-            # Recompute endpoint jacobian and residual:
+            # The endpoint Jacobian defines the lambda map itself, so a stale one
+            # makes the step wrong and it is refreshed every iteration.  Only the
+            # position Jacobian, which is an order of magnitude dearer and moves
+            # slowly, is held across steps:
             e, Co = system.endpoint_jac(U)
             if OBS and (Jp is None or inner_it % jac_reuse == 0):
                 Jp = np.array(system.pos_jac(U))
-            r = Z[-1][tidx] - zt
+            delta = Z[-1][tidx] - zt
 
             # Cost gradient, with the obstacle terms folded in:
             g = weighted_cost_grad(U, r_diag)
-            con_rows = np.zeros((0, n_dof))
+            G = np.zeros((0, n_dof))
             if OBS:
-                g, con_rows = augmented_lagrange_grad(
-                    system, p, Jp, OBS, radii, mu, rho, g, n_dof)
+                g, G = augmented_lagrange_grad(
+                    system, p, Jp, OBS, radii, mu, rho, g, n_dof, planes)
 
-            # Inverse of H = hess + rho C'C applied by the Woodbury identity, which
-            # turns an n_dof by n_dof system into one the size of the active set:
-            if con_rows.shape[0]:
-                n_act = con_rows.shape[0]
-                mid = np.eye(n_act) / rho + (con_rows * hess_inv) @ con_rows.T \
+            # Active obstacles deform the control weight to R_eff = R_N + rho G'G.
+            # No second derivative is taken anywhere: G'G is an outer product of
+            # first derivatives, the same construction as C_o R_N^-1 C_o' below.
+            # Woodbury turns the inverse into a solve the size of the active set:
+            if G.shape[0]:
+                n_act = G.shape[0]
+                M_act = np.eye(n_act) / rho + (G * R_N_inv) @ G.T \
                     + 1e-12 * np.eye(n_act)
 
-                def apply_hess_inv(V, C=con_rows, Mid=mid):
-                    corr = C.T @ safe_solve(Mid, (C * hess_inv) @ V)
-                    return (hess_inv[:, None] * (V - corr)) if V.ndim > 1 \
-                        else hess_inv * (V - corr)
+                def apply_R_eff_inv(V, G=G, M_act=M_act):
+                    corr = G.T @ safe_solve(M_act, (G * R_N_inv) @ V)
+                    return (R_N_inv[:, None] * (V - corr)) if V.ndim > 1 \
+                        else R_N_inv * (V - corr)
 
-            # With no active rows the Hessian is just the effort term:
+            # With no active rows the weight is R_N itself:
             else:
 
-                def apply_hess_inv(V):
-                    return (hess_inv[:, None] * V) if V.ndim > 1 else hess_inv * V
+                def apply_R_eff_inv(V):
+                    return (R_N_inv[:, None] * V) if V.ndim > 1 else R_N_inv * V
 
-            # Weighted controllability Gramian and the lambda step.  With no
-            # obstacles H is the effort Hessian and this reduces exactly to the
-            # least-norm control satisfying the linearized endpoint constraint:
-            Hi_Co = apply_hess_inv(Co.T)
-            Gram = Co @ Hi_Co + reg * np.eye(m)
-            Hi_g = apply_hess_inv(g)
-            F = -(Hi_g - Hi_Co @ safe_solve(Gram, Co @ Hi_g - r))
-            step_norm = np.linalg.norm(F)
+            # Weighted output controllability Gramian W_R = C_o R_eff^-1 C_o',
+            # and the lambda step.  Only an m by m system is ever formed, so the
+            # cost is independent of horizon length.  With no obstacles R_eff is
+            # R_N and this is exactly Eq. (76) of the paper: the least-norm
+            # control, in the R_N metric, closing the observation gap:
+            R_inv_Co = apply_R_eff_inv(Co.T)
+            W_R = Co @ R_inv_Co + reg * np.eye(m)
+            R_inv_grad = apply_R_eff_inv(g)
+            dU = -(R_inv_grad - R_inv_Co @ safe_solve(W_R, Co @ R_inv_grad - delta))
+            step_norm = np.linalg.norm(dU)
             if not np.isfinite(step_norm):
                 U = U_best
                 break
@@ -285,7 +311,11 @@ def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
             if step_norm < ftol * max(np.linalg.norm(U), 1.0):
                 break
 
-            # With no obstacles the step is a fixed-point map:
+            # With no obstacles the step is a fixed-point map, so mixing the last
+            # few residuals cancels the slow mode and cuts the iteration count by
+            # roughly an order of magnitude.  With active obstacle rows the step
+            # is already Newton on the augmented Lagrangian and mixing it is
+            # unstable, so that path takes a line search on the merit instead:
             if not OBS:
 
                 # A growing step means the mixing has left the region where it is
@@ -300,7 +330,7 @@ def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
 
                 # Append to the history and keep only the most recent entries:
                 hist_U.append(U.copy())
-                hist_F.append(F.copy())
+                hist_F.append(dU.copy())
                 if len(hist_U) > depth:
                     hist_U.pop(0)
                     hist_F.pop(0)
@@ -308,37 +338,40 @@ def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
                 # Damped step of the plain map on the first pass, mixed step after:
                 n_hist = len(hist_U)
                 if n_hist == 1:
-                    U_new = U + blend * F
+                    U_new = U + blend * dU
                 else:
                     dF = np.column_stack(
                         [hist_F[i + 1] - hist_F[i] for i in range(n_hist - 1)])
-                    dU = np.column_stack(
+                    dU_hist = np.column_stack(
                         [hist_U[i + 1] - hist_U[i] for i in range(n_hist - 1)])
                     try:
-                        gamma = np.linalg.lstsq(dF, F, rcond=1e-10)[0]
-                        U_new = U + blend * F - (dU + blend * dF) @ gamma
+                        gamma = np.linalg.lstsq(dF, dU, rcond=1e-10)[0]
+                        U_new = U + blend * dU - (dU_hist + blend * dF) @ gamma
                     except np.linalg.LinAlgError:
-                        U_new = U + blend * F
+                        U_new = U + blend * dU
 
-                # Reject a mixed step that is non-finite or far longer than the plan step:
+                # Reject a mixed step that is non-finite or far longer than the
+                # plain step, and fall back to the plain step in either case:
                 if not np.all(np.isfinite(U_new)) or \
                         np.linalg.norm(U_new - U) > 50.0 * max(step_norm, 1e-12):
                     hist_U.clear()
                     hist_F.clear()
                     blend = max(blend * 0.5, 1e-3)
-                    U_new = U + blend * F
+                    U_new = U + blend * dU
 
                 # Project the trial step into the box constraints:
                 U = project_box(U_new, lo, hi)
                 continue
 
-            # Line search on the augmented Lagrangian merit:
-            merit = weighted_cost(U, r_diag) + penalty + 1e4 * np.linalg.norm(r)
+            # Line search on the augmented Lagrangian merit.  Only the rollout is
+            # needed here, never the position Jacobian, which is the single
+            # largest saving in the obstacle path:
+            merit = weighted_cost(U, r_diag) + penalty + 1e4 * np.linalg.norm(delta)
             moved = False
             for a in [1.0, 0.5, 0.25, 0.1, 0.05, 0.02]:
-                U_try = project_box(U + a * F, lo, hi)
+                U_try = project_box(U + a * dU, lo, hi)
                 _, _, penalty_try, _, err_try = augmented_lagrange(
-                    system, U_try, OBS, radii, mu, rho, tidx, zt)
+                    system, U_try, OBS, radii, mu, rho, tidx, zt, planes)
                 if not np.isfinite(penalty_try + err_try):
                     continue
                 if weighted_cost(U_try, r_diag) + penalty_try + 1e4 * err_try < merit:
@@ -355,16 +388,21 @@ def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
             U = U_best
             break
 
-        # Multiplier update, and the complementarity measure:
+        # Multiplier update, and the complementarity measure.  A positive
+        # multiplier on a node that is standing off is exactly what freezes an
+        # unnecessary margin, so convergence requires it to have decayed:
         Z, p, _, worst_viol, _ = augmented_lagrange(
-            system, U, OBS, radii, mu, rho, tidx, zt)
+            system, U, OBS, radii, mu, rho, tidx, zt, planes)
         slack = 0.0
         for i, o in enumerate(OBS):
-            d, _ = segment_distances(p, o)
+            cols = list(range(p.shape[1])) if planes is None else list(planes[i])
+            d, _ = segment_distances(p[:, cols], o)
             mu[i] = np.maximum(0.0, mu[i] + rho * (radii[i] - d))
             slack = max(slack, float(np.max(mu[i] * np.maximum(0.0, d - radii[i]))))
 
-        # At least one multiplier update has to happen before the outer loop can exit:
+        # At least one multiplier update has to happen before the outer loop can
+        # exit, otherwise the penalty alone shaped the answer and complementarity
+        # was never tested:
         if outer_it > 0 and worst_viol < 1e-7 and slack < tol_c:
             break
 
@@ -380,11 +418,14 @@ def lambda_shoot(system, z_target, obstacles=None, R=None, U0=None,
     end_err = np.linalg.norm(system.endpoint(U) - zt)
     system._infeasible = bool(end_err > 1e-2)
 
-    # Flag if an obstacle is still penetrated:
+    # Flag if an obstacle is still penetrated, measured on the true path rather
+    # than at the nodes alone:
     if OBS:
         p = np.asarray(system.rollout(U))[:, list(system.pos_idx)]
-        margin = min((segment_distances(p, o)[0] - radii[i]).min()
-                     for i, o in enumerate(OBS))
+        margin = np.inf
+        for i, o in enumerate(OBS):
+            cols = list(range(p.shape[1])) if planes is None else list(planes[i])
+            margin = min(margin, (segment_distances(p[:, cols], o)[0] - radii[i]).min())
         system._infeasible = bool(system._infeasible or margin < -1e-2)
 
     # Warn if the request could not be met:

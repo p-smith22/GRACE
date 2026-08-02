@@ -94,8 +94,12 @@ def _graph_functions(step, F_roll, F_end, nx, nu, N, pos_idx):
         Z = F_roll(U, Z0)
         pos = Z[:, list(pos_idx)]
 
+        # One column per position index rather than an assumed two, so a system
+        # built for obstacles in three coordinate planes emits all three:
+        npos = len(pos_idx)
+
         # ca.reshape is column-major, so reshape the transpose for row order:
-        flat = ca.reshape(pos.T, (N + 1) * 2, 1)
+        flat = ca.reshape(pos.T, (N + 1) * npos, 1)
         funcs.append(ca.Function("F_pos", [U, Z0], [ca.jacobian(flat, U)]))
     return funcs
 
@@ -194,9 +198,12 @@ def load(job, data_dir=DATA_DIR):
         Bs = [Bb[:, k * nu:(k + 1) * nu] for k in range(N)]
         return As, Bs
 
-    # Position Jacobian, reshaped to (N+1, 2, N*nu), if the system had one:
+    # Position Jacobian, reshaped to (N+1, npos, N*nu), if the system had one.
+    # npos is read back from the saved indices rather than assumed to be two, so
+    # a system built for obstacles in three planes reloads at the right shape:
     pos_jac = None
     if bool(meta["has_pos"]):
+        npos = len(list(meta["pos_idx"])) if "pos_idx" in meta.files else 2
         F_pos = ca.external("F_pos", so_path)
 
         # The starting state is a runtime argument, never baked into the graph,
@@ -204,7 +211,7 @@ def load(job, data_dir=DATA_DIR):
         def pos_jac(Uv, z_start=None):
             zs = reloaded.z0 if z_start is None else z_start
             J = F_pos(np.asarray(Uv).flatten(), np.asarray(zs, float))
-            return np.array(J).reshape(N + 1, 2, N * nu)
+            return np.array(J).reshape(N + 1, npos, N * nu)
 
     # Assemble and return the reloaded System:
     reloaded = System(F_end, F_roll, step, step_jac, nx, nu, N,

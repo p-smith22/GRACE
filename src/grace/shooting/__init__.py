@@ -20,9 +20,9 @@ class Shooting:
         return _newton_shoot(self.system, zt, U0=U0, it=it, u_lo=u_lo, u_hi=u_hi)
 
     # Lambda shoot for optimal control:
-    def lambda_shoot(self, target, obstacles=None, R=None, pos_idx=(0, 1),
-                     U0=None, max_it=None, u_lo=None, u_hi=None, R_weights=None,
-                     **kwargs):
+    def lambda_shoot(self, target, obstacles=None, R=None, pos_idx=None,
+                     planes=None, U0=None, max_it=None, u_lo=None, u_hi=None,
+                     R_weights=None, **kwargs):
 
         # Obstacles are no longer a separate solver.  They enter the same
         # minimum-effort shoot as augmented-Lagrangian terms in the cost
@@ -38,6 +38,10 @@ class Shooting:
         # the descent directions are wrong and it fails quietly:
         if obstacles is not None:
             built = getattr(self.system, "pos_idx", None)
+            if pos_idx is None:
+                pos_idx = list(built)
+            elif list(built) != list(pos_idx):
+                raise ValueError(...)
             if built is None:
                 raise ValueError("obstacle avoidance needs a position Jacobian -- "
                                  "rebuild the system with pos_idx=%s"
@@ -55,8 +59,9 @@ class Shooting:
             kwargs["max_it"] = max_it
 
         # Run the unified shoot:
-        return _lambda_shoot(self.system, target, obstacles=obstacles, R=R, U0=U0,
-                             u_lo=u_lo, u_hi=u_hi, R_weights=R_weights, **kwargs)
+        return _lambda_shoot(self.system, target, obstacles=obstacles, R=R,
+                             planes=planes, U0=U0, u_lo=u_lo, u_hi=u_hi,
+                             R_weights=R_weights, **kwargs)
 
 # Name:
 __all__ = ["Shooting"]

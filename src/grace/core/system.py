@@ -172,15 +172,20 @@ def build(dynamics, nx, nu, N, z0, dt, target_idx=None, pos_idx=None,
 
         # Compute function rollout:
         pos = Zmat[:, list(pos_idx)]
-        posflat = ca.reshape(pos.T, (N + 1) * 2, 1)
+
+        # One column per position index, so a system built for obstacle
+        # avoidance in three planes carries all three:
+        npos = len(pos_idx)
+        posflat = ca.reshape(pos.T, (N + 1) * npos, 1)
         Jpos = ca.jacobian(posflat, U)
+
         F_pos = ca.Function("F_pos", [U, Z0], [Jpos], opts)
 
         # Reshape the compiled position Jacobian to (N+1, 2, N*nu):
         def pos_jac(Uv, z_start=None):
             zs = system.z0 if z_start is None else z_start
             return np.array(F_pos(np.asarray(Uv).flatten(),
-                                  np.asarray(zs, float))).reshape(N + 1, 2, N * nu)
+                                  np.asarray(zs, float))).reshape(N + 1, npos, N * nu)
 
     # Assemble the System:
     system = System(F_end, F_roll, step, step_jac, nx, nu, N, z0, dt,
