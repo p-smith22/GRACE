@@ -3,7 +3,7 @@ import numpy as np
 import casadi as ca
 import os
 import grace
-
+import time
 
 # Cart-pole dynamics (pole hangs at theta = 0, upright at theta = pi):
 def cartpole(x, u, l=0.5):
@@ -22,7 +22,7 @@ def main():
     # Set directory:
     os.makedirs(f"figures/{job_name}", exist_ok=True)
 
-    # Define trajectory (6 s covers the pumping a swing-up needs):
+    # Define trajectory:
     N, dt = 30, 0.05
 
     # Define system and engine (build_cached actually writes the graph cache):
@@ -33,13 +33,10 @@ def main():
     target = np.array([5.0, np.pi, 0.0, 0.0])
 
     # Generate control to target state:
+    start = time.time()
     U = engine.shooting.lambda_shoot(target)
     Z = system.rollout(U)
-
-    # Report the endpoint with theta wrapped, since -pi is upright too:
-    err = Z[-1] - target
-    err[1] = (err[1] + np.pi) % (2 * np.pi) - np.pi
-    print(f"endpoint error {np.linalg.norm(err):.2e}, cost {float(U @ U):.2f}, peak force {np.abs(U).max():.2f} N")
+    print(f"SIMPLE CASE ({time.time() - start:.2f}s): {engine.utils.diagnostics(U, target)}")
 
     # Plot:
     engine.utils.plotting(

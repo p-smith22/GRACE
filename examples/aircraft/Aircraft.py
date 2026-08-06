@@ -3,6 +3,7 @@ import numpy as np
 import os
 import grace
 from Aircraft_Dynamics import f as aircraft, f_codesign, X0
+import time
 
 # Main run function:
 def main():
@@ -23,7 +24,7 @@ def main():
     # Bulid system and engine (cached):
     system = grace.build_cached(
         aircraft, nx=12, nu=3, N=N, z0=list(X0), dt=dt,
-        target_idx=lane_idx, pos_idx=(9, 10), job=job_name,
+        target_idx=lane_idx, job=job_name,
     )
     engine = grace.GRACE(system)
 
@@ -31,10 +32,18 @@ def main():
     target = X0.copy()
     target[10] = 10.0
 
-    # Find optimal control to target with realistic bounds:
+    # Control limits as constraints, one expression per side per surface:
     ctrl_bounds = np.array([20, 15, 10])
-    U = engine.shooting.lambda_shoot(target, u_lo=-ctrl_bounds, u_hi=ctrl_bounds)
+    surface_limits = []
+    for i, b in enumerate(ctrl_bounds):
+        surface_limits.append(lambda z, u, i=i, b=b: u[i] - b)
+        surface_limits.append(lambda z, u, i=i, b=b: -b - u[i])
+
+    # Find optimal control to target with realistic bounds:
+    start = time.time()
+    U = engine.shooting.lambda_shoot(target, constraints=surface_limits)
     Z = system.rollout(U)
+    print(f"SIMPLE CASE ({time.time() - start:.2f}s): {engine.utils.diagnostics(U, target, surface_limits)}")
 
     # Plot:
     engine.utils.plotting(
@@ -57,7 +66,7 @@ def main():
     obs_lane_idx = [3, 4, 5, 6, 7, 8, 9, 10]
     sys_obs = grace.build_cached(
         aircraft, nx=12, nu=3, N=N_obs, z0=list(X0), dt=0.05,
-        target_idx=obs_lane_idx, pos_idx=(9, 10), job=job_name,
+        target_idx=obs_lane_idx, job=job_name,
     )
     eng_obs = grace.GRACE(sys_obs)
 
@@ -68,13 +77,23 @@ def main():
     target_obs[10] = 0.0
 
     # Define obstacle:
-    obstacles = [[downrange * 0.5, 0.0]]
-    R_obs = 8.0
+    obstacles = [[downrange * 1/3, 1.0],[downrange * 2/3, -1.0]]
+    R_obs = 6.0
+
+    # Keep-out zone in the X-Y plane, alongside the same surface limits.  The
+    # solver does not distinguish them: both are expressions g(z, u) <= 0:
+    obstacle_zones = [
+        (lambda z, u, o=o: R_obs ** 2 - ((z[9] - o[0]) ** 2 + (z[10] - o[1]) ** 2))
+        for o in obstacles
+    ]
+    constraints = obstacle_zones + surface_limits
 
     # Solve:
-    U_obs = eng_obs.shooting.lambda_shoot(target_obs, obstacles=obstacles, R=R_obs,
-                                          pos_idx=(9, 10), u_lo=-ctrl_bounds, u_hi=ctrl_bounds)
+    start = time.time()
+    U_obs = eng_obs.shooting.lambda_shoot(
+        target_obs, constraints=obstacle_zones + surface_limits, outer=50, inner=20)
     Z_obs = sys_obs.rollout(U_obs)
+    print(f"OBSTACLE AVOIDANCE CASE ({time.time() - start:.2f}s): {eng_obs.utils.diagnostics(U_obs, target_obs, constraints)}")
 
     # Plot:
     engine.utils.plotting(

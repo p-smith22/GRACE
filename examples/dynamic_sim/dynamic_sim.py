@@ -51,7 +51,7 @@ VIEW_W = SCREEN_W - PANEL_W
 # Horizon ladder.  The solve starts at the shortest horizon and steps up only
 # when the request comes back infeasible, so an easy hop stays fast and a hard
 # manoeuvre is given the extra time it actually needs:
-HORIZONS = [(70, 0.12), (100, 0.12), (140, 0.14)]
+HORIZONS = [(60, 0.06), (140, 0.14)]
 FPS = 60
 CTRL_SUBSTEPS = 7
 HOVER_T = 9.81
@@ -216,13 +216,12 @@ class Planner:
 
         # One cached system per horizon on the ladder.  They compile once and
         # reload in milliseconds afterwards, so stepping up costs nothing at run
-        # time.  pos_idx spans all three position states because obstacles may
-        # be cylinders in any of the three coordinate planes:
+        # time:
         self.levels = []
         for N, dt in HORIZONS:
             system = grace.build_cached(
                 quadcopter, nx=12, nu=4, N=N, z0=hover_state(4, 15, 10), dt=dt,
-                pos_idx=(0, 1, 2), job=f"quad_sim_N{N}")
+                job=f"quad_sim_N{N}")
             U_hover = np.tile(np.array([HOVER_T, 0.0, 0.0, 0.0]), N)
             self.levels.append(dict(system=system, engine=grace.GRACE(system),
                                     N=N, dt=dt, U_hover=U_hover,
@@ -252,12 +251,19 @@ class Planner:
         # target, so they only have to bend it around the cylinders:
         U = engine.shooting.lambda_shoot(target, R_weights=W, U0=U_hover)
         if obstacles:
-            centres = [list(o["centre"]) for o in obstacles]
-            radii = [o["radius"] + VEH_R for o in obstacles]
-            planes = [PLANES[o["plane"]] for o in obstacles]
+
+            # Each cylinder becomes an expression g(z, u) <= 0 measured in the
+            # two position states its cross-section plane names.  The centre,
+            # radius and plane are closed over so every lambda keeps its own:
+            cons = []
+            for o in obstacles:
+                a, b = PLANES[o["plane"]]
+                c = np.asarray(o["centre"], float)
+                r = o["radius"] + VEH_R
+                cons.append(lambda z, u, a=a, b=b, c=c, r=r:
+                            r ** 2 - ((z[a] - c[0]) ** 2 + (z[b] - c[1]) ** 2))
             U = engine.shooting.lambda_shoot(
-                target, obstacles=centres, R=radii, planes=planes,
-                R_weights=W, U0=U, jac_reuse=15)
+                target, constraints=cons, R_weights=W, U0=U, outer=60, inner=30)
         Z = np.asarray(system.rollout(U))
         ok = not getattr(system, "_infeasible", False)
         K, _ = engine.tracking.lqr_gains(U, self.Q, self.R_for(lvl), Qf=self.Qf)

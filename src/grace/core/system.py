@@ -12,7 +12,7 @@ class System:
 
     # Hold the compiled functions and problem dimensions for one dynamics model:
     def __init__(self, F_end, F_roll, step, step_jac, nx, nu, N, z0, dt,
-                 target_idx=None, pos_jac=None, job=None, pos_idx=None):
+                 target_idx=None, job=None):
 
         # Store the compiled CasADi functions:
         self.F_end = F_end                      # endpoint map U -> [g, dg/dU]
@@ -20,7 +20,6 @@ class System:
         self.step = step                        # one-step dynamics z, u -> z_next
         self.step_jac = step_jac                # one-step Jacobians z, u -> [A, B]
         self.step_jac_all = None                # batched Jacobians over the whole tape
-        self.pos_jac = pos_jac                  # position Jacobian U -> dPos/dU
 
         # Store the problem dimensions:
         self.nx = nx                            # state dimension
@@ -36,13 +35,26 @@ class System:
         # Store the job name used for graph caching:
         self.job = job
 
-        # Store the position indices used for obstacle avoidance (for caching):
-        self.pos_idx = list(pos_idx) if pos_idx is not None else None
-
         # Last-value caches for the rollout and endpoint+Jacobian, keyed on the
-        # control tape so repeated evaluations on the same U are free:
+        # control tape so repeated evaluations on the same U are free.  The
+        # solve leans on these heavily: a line search evaluates constraints at a
+        # trial control and then, if it accepts, evaluates them again as the new
+        # iterate, and without the caches every one of those is a fresh graph
+        # call:
         self._roll_cache = None
         self._endjac_cache = None
+
+        # Row Jacobians are compiled per index set on demand and cached the same
+        # way, so a limit on one state costs one row rather than all nx:
+        self._row_funcs = {}
+        self._row_cache = {}
+
+        # Expanding a rollout Jacobian from MX to SX makes it roughly thirty
+        # times cheaper to evaluate but costs far more to build, so it is done
+        # lazily: a function that has been called enough times to repay the
+        # build gets expanded, and a one-shot solve never pays for it:
+        self._row_calls = {}
+        self._expand_after = 30
 
     # Roll the control tape out to the full state trajectory:
     def rollout(self, U):
@@ -89,6 +101,47 @@ class System:
         g, _ = self.endpoint_jac(U)
         return g
 
+    # Jacobian of a chosen set of state rows along the whole trajectory:
+    def row_jac(self, U, idx):
+
+        # A limit on one state should cost one row, not all nx of them, so a
+        # small function is compiled per index set the first time it is asked
+        # for and then cached like everything else:
+        key = tuple(idx)
+        Uf = np.asarray(U, float).flatten()
+        z0 = np.asarray(self.z0, float)
+
+        # Return the cached rows if this is the same tape and start:
+        hit = self._row_cache.get(key)
+        if (hit is not None and hit[0].shape == Uf.shape
+                and np.array_equal(hit[0], Uf) and np.array_equal(hit[2], z0)):
+            return hit[1]
+
+        # Compile the row Jacobian for this index set once:
+        if key not in self._row_funcs:
+            Us = ca.MX.sym("U", self.N * self.nu)
+            Z0 = ca.MX.sym("Z0", self.nx)
+            Zs = self.F_roll(Us, Z0)
+            flat = ca.reshape(Zs[:, list(key)].T, (self.N + 1) * len(key), 1)
+            self._row_funcs[key] = ca.Function("F_row", [Us, Z0],
+                                               [ca.jacobian(flat, Us)])
+
+        # Once this index set has been asked for often enough, the expansion
+        # pays for itself over the calls still to come:
+        n = self._row_calls.get(key, 0) + 1
+        self._row_calls[key] = n
+        if n == self._expand_after:
+            try:
+                self._row_funcs[key] = self._row_funcs[key].expand()
+            except Exception:
+                self._expand_after = 10 ** 9
+
+        # Evaluate, cache and return:
+        J = np.array(self._row_funcs[key](Uf, z0)).reshape(
+            self.N + 1, len(key), self.N * self.nu)
+        self._row_cache[key] = (Uf.copy(), J, z0.copy())
+        return J
+
     # Reduce a full state target to the constrained components:
     def target(self, z_target):
 
@@ -105,7 +158,7 @@ class System:
         return np.array(self.step(z, u)).flatten()
 
 # Build a compiled System from a user's dynamics function:
-def build(dynamics, nx, nu, N, z0, dt, target_idx=None, pos_idx=None,
+def build(dynamics, nx, nu, N, z0, dt, target_idx=None,
           substeps=1, jit=True, job=None, data_dir=DATA_DIR, rebuild=False):
 
     # Symbolic definitions:
@@ -166,30 +219,9 @@ def build(dynamics, nx, nu, N, z0, dt, target_idx=None, pos_idx=None,
     F_end = ca.Function("F_end", [U, Z0], [gend, ca.jacobian(gend, U)], opts)
     F_roll = ca.Function("F_roll", [U, Z0], [Zmat], opts)
 
-    # Optionally compile the position Jacobian for obstacle avoidance:
-    pos_jac = None
-    if pos_idx is not None:
-
-        # Compute function rollout:
-        pos = Zmat[:, list(pos_idx)]
-
-        # One column per position index, so a system built for obstacle
-        # avoidance in three planes carries all three:
-        npos = len(pos_idx)
-        posflat = ca.reshape(pos.T, (N + 1) * npos, 1)
-        Jpos = ca.jacobian(posflat, U)
-
-        F_pos = ca.Function("F_pos", [U, Z0], [Jpos], opts)
-
-        # Reshape the compiled position Jacobian to (N+1, 2, N*nu):
-        def pos_jac(Uv, z_start=None):
-            zs = system.z0 if z_start is None else z_start
-            return np.array(F_pos(np.asarray(Uv).flatten(),
-                                  np.asarray(zs, float))).reshape(N + 1, npos, N * nu)
-
     # Assemble the System:
     system = System(F_end, F_roll, step, step_jac, nx, nu, N, z0, dt,
-                    target_idx=tidx, pos_jac=pos_jac, job=job, pos_idx=pos_idx)
+                    target_idx=tidx, job=job)
     system.step_jac_all = step_jac_all
 
     # Return the ready System:

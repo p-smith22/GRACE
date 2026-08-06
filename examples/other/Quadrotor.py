@@ -3,6 +3,7 @@ import numpy as np
 import casadi as ca
 import os
 import grace
+import time
 
 # Planar quadrotor dynamics:
 def quadrotor(x, u):
@@ -22,12 +23,12 @@ def main():
     os.makedirs(f"figures/{job_name}", exist_ok=True)
 
     # Define length of trajectory:
-    N, dt = 60, 0.05
+    N, dt = 120, 0.05
 
     # Build system and engine (and cache):
     system = grace.build_cached(
         quadrotor, nx=6, nu=2, N=N, z0=[0, 0, 0, 0, 0, 0], dt=dt,
-        pos_idx=(0, 1), job=job_name,
+        job=job_name,
     )
     engine = grace.GRACE(system)
 
@@ -36,7 +37,9 @@ def main():
 
     # === OPTIMAL CONTROL TO SIMPLE TARGET ===
     # Solve for optimal control sequence to target:
+    start = time.time()
     U = engine.shooting.lambda_shoot(target)
+    print(f"SIMPLE CASE ({time.time() - start:.2f}s): {engine.utils.diagnostics(U, target)}")
 
     # Plot:
     Z = system.rollout(U)
@@ -79,15 +82,24 @@ def main():
     gains_swept = [round(fp["param"], 2) for fp in front]
     print(f"codesign       : optimal thrust gain p = {p_opt:.3f}, front sweeps {gains_swept}")
 
-    # === OBSTACLE AVIODANCE ===
+    # === OBSTACLE AVOIDANCE ===
     # Define obstacle:
-    obstacles = [[4.0, 0]]
-    R_obs = 3
-    target = np.array([8.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    obstacles = [[4.0, 0.5], [8.0, -0.5], [12.0, 0.5]]
+    R_obs = 1
+    target = np.array([16.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+    # Keep-out zones as constraints.  Each is an expression g(z, u) <= 0, with
+    # the centre closed over so every lambda keeps its own:
+    constraints = [
+        (lambda z, u, o=o: R_obs ** 2 - ((z[0] - o[0]) ** 2 + (z[1] - o[1]) ** 2))
+        for o in obstacles
+    ]
 
     # Find optimal control and trajectory:
-    U_obs = engine.shooting.lambda_shoot(target, obstacles=obstacles, R=R_obs)
+    start = time.time()
+    U_obs = engine.shooting.lambda_shoot(target, constraints=constraints)
     Z_obs = system.rollout(U_obs)
+    print(f"OBSTACLE AVOIDANCE CASE ({time.time() - start:.2f}s): {engine.utils.diagnostics(U_obs, target, constraints)}")
 
     # Plot:
     engine.utils.plotting(
@@ -104,4 +116,3 @@ def main():
 # Run on call:
 if __name__ == "__main__":
     main()
-

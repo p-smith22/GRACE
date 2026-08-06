@@ -16,11 +16,8 @@ def _graph_key(system):
         graph = graph.encode()
 
     # Dimensions and index sets change the compiled code, so they are keyed too:
-    pos_idx = getattr(system, "pos_idx", None)
     shape = repr((system.nx, system.nu, system.N, float(system.dt),
-                  tuple(system.tidx),
-                  None if pos_idx is None else tuple(pos_idx),
-                  int(getattr(system, "substeps", 1))))
+                  tuple(system.tidx), int(getattr(system, "substeps", 1))))
     return hashlib.sha256(graph + b"|" + shape.encode()).hexdigest()[:16]
 
 
@@ -67,7 +64,7 @@ def _compiler():
 
 
 # Build the full set of functions that a reloaded System needs:
-def _graph_functions(step, F_roll, F_end, nx, nu, N, pos_idx):
+def _graph_functions(step, F_roll, F_end, nx, nu, N):
 
     # Set symbolic graph:
     z = ca.MX.sym("z", nx)
@@ -84,23 +81,17 @@ def _graph_functions(step, F_roll, F_end, nx, nu, N, pos_idx):
     U_tape = ca.MX.sym("U_tape", nu, N)
     A_map = ca.Function("A_map", [Z_tape, U_tape], [A.map(N)(Z_tape, U_tape)])
     B_map = ca.Function("B_map", [Z_tape, U_tape], [B.map(N)(Z_tape, U_tape)])
+    # The state-trajectory Jacobian is emitted too.  A reloaded F_roll is a
+    # compiled external and cannot be differentiated, so anything needing dZ/dU
+    # has to find it already built:
+    U = ca.MX.sym("U", N * nu)
+    Z0 = ca.MX.sym("Z0", nx)
+    Zs = F_roll(U, Z0)
+    flat = ca.reshape(Zs.T, (N + 1) * nx, 1)
+    F_stateJ = ca.Function("F_stateJ", [U, Z0], [ca.jacobian(flat, U)])
     funcs = [ca.Function("step", [z, u], [z_next]), F_roll, F_end,
-             A, B, A_map, B_map]
+             A, B, A_map, B_map, F_stateJ]
 
-    # Position Jacobian, only if the system was built with position indices:
-    if pos_idx is not None:
-        U = ca.MX.sym("U", N * nu)
-        Z0 = ca.MX.sym("Z0", nx)
-        Z = F_roll(U, Z0)
-        pos = Z[:, list(pos_idx)]
-
-        # One column per position index rather than an assumed two, so a system
-        # built for obstacles in three coordinate planes emits all three:
-        npos = len(pos_idx)
-
-        # ca.reshape is column-major, so reshape the transpose for row order:
-        flat = ca.reshape(pos.T, (N + 1) * npos, 1)
-        funcs.append(ca.Function("F_pos", [U, Z0], [ca.jacobian(flat, U)]))
     return funcs
 
 
@@ -123,8 +114,7 @@ def compile_graph(system, key, data_dir=DATA_DIR, opt="-O2", verbose=False):
 
     # Emit every function the reloaded system needs into a single C file:
     funcs = _graph_functions(system.step, system.F_roll, system.F_end,
-                             system.nx, system.nu, system.N,
-                             getattr(system, "pos_idx", None))
+                             system.nx, system.nu, system.N)
     c_path = os.path.join(d, "graph.c")
     gen = ca.CodeGenerator(os.path.basename(c_path), {"with_header": False})
     for f in funcs:
@@ -149,10 +139,7 @@ def compile_graph(system, key, data_dir=DATA_DIR, opt="-O2", verbose=False):
 
     # Record the key and the dimensions needed to reassemble the System:
     meta = dict(key=key, nx=system.nx, nu=system.nu, N=system.N, z0=system.z0,
-                dt=system.dt, tidx=np.array(system.tidx),
-                has_pos=getattr(system, "pos_idx", None) is not None)
-    if getattr(system, "pos_idx", None) is not None:
-        meta["pos_idx"] = np.array(system.pos_idx)
+                dt=system.dt, tidx=np.array(system.tidx))
     np.savez(meta_path, **meta)
     return so_path
 
@@ -198,37 +185,38 @@ def load(job, data_dir=DATA_DIR):
         Bs = [Bb[:, k * nu:(k + 1) * nu] for k in range(N)]
         return As, Bs
 
-    # Position Jacobian, reshaped to (N+1, npos, N*nu), if the system had one.
-    # npos is read back from the saved indices rather than assumed to be two, so
-    # a system built for obstacles in three planes reloads at the right shape:
-    pos_jac = None
-    if bool(meta["has_pos"]):
-        npos = len(list(meta["pos_idx"])) if "pos_idx" in meta.files else 2
-        F_pos = ca.external("F_pos", so_path)
+    # Row Jacobians come from the emitted state Jacobian, sliced to the
+    # requested indices and cached on the control tape:
+    F_stateJ = ca.external("F_stateJ", so_path)
 
-        # The starting state is a runtime argument, never baked into the graph,
-        # so a reloaded system can be reused from a different initial state:
-        def pos_jac(Uv, z_start=None):
-            zs = reloaded.z0 if z_start is None else z_start
-            J = F_pos(np.asarray(Uv).flatten(), np.asarray(zs, float))
-            return np.array(J).reshape(N + 1, npos, N * nu)
+    def row_jac(U, idx):
+        key = tuple(idx)
+        Uf = np.asarray(U, float).flatten()
+        z0 = np.asarray(reloaded.z0, float)
+        hit = reloaded._row_cache.get(key)
+        if (hit is not None and hit[0].shape == Uf.shape
+                and np.array_equal(hit[0], Uf) and np.array_equal(hit[2], z0)):
+            return hit[1]
+        full = np.array(F_stateJ(Uf, z0)).reshape(N + 1, nx, N * nu)
+        J = full[:, list(key), :]
+        reloaded._row_cache[key] = (Uf.copy(), J, z0.copy())
+        return J
 
     # Assemble and return the reloaded System:
     reloaded = System(F_end, F_roll, step, step_jac, nx, nu, N,
                       meta["z0"], float(meta["dt"]), target_idx=list(meta["tidx"]),
-                      pos_jac=pos_jac, job=job)
+                      job=job)
     reloaded.step_jac_all = step_jac_all
-    if bool(meta["has_pos"]) and "pos_idx" in meta.files:
-        reloaded.pos_idx = list(meta["pos_idx"])
+    reloaded.row_jac = row_jac
     return reloaded
 
 # Build a System, compiling it once and reloading the compiled object after:
-def build_cached(dynamics, nx, nu, N, z0, dt, job, target_idx=None, pos_idx=None,
+def build_cached(dynamics, nx, nu, N, z0, dt, job, target_idx=None,
                  substeps=1, jit=False, data_dir=DATA_DIR, rebuild=False, verbose=False):
 
     # Build symbolic graph:
     system = build(dynamics, nx, nu, N, z0, dt, target_idx=target_idx,
-                   pos_idx=pos_idx, substeps=substeps, jit=False, job=job)
+                   substeps=substeps, jit=False, job=job)
     system.substeps = substeps
     key = _graph_key(system)
 

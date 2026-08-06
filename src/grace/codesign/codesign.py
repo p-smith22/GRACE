@@ -1,12 +1,8 @@
 # Import packages and shooting:
-import os
 import numpy as np
 from ..shooting.bounds import safe_solve
 import casadi as ca
-
 from ..shooting.lambda_shoot import lambda_shoot
-from ..core.system import build as build_system
-
 
 # Build a parameterized system family and its parameter-sensitivity rollout:
 def _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps=1, jit=True,
@@ -28,24 +24,18 @@ def _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps=1, jit
         zc = zc + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
     step = ca.Function("step", [z, u, p], [zc])
 
-    # Build the full rollout with a compiled scan (mapaccum) rather than an
-    # unrolled Python loop -- the unrolled graph is what made high-dimensional
-    # nonlinear rollouts (e.g. the 6DOF aircraft) slow to evaluate:
+    # Build the full rollout with a compiled scan:
     U = ca.MX.sym("U", N * nu)
     Useq = ca.reshape(U, nu, N)
     acc = step.mapaccum("roll", N)
     Zc = acc(ca.DM(z0), Useq, ca.repmat(p, 1, N))
     Zmat = ca.horzcat(ca.DM(z0), Zc).T
 
-    # Constrain only the requested endpoint components (default: all states).
-    # For high-dimensional systems like the 6DOF aircraft, targeting every state
-    # over-constrains the shoot; a maneuver targets the states that define it
-    # (e.g. attitude and rates for a roll) and lets the rest settle freely:
+    # Constrain only the requested endpoint components:
     tidx = list(range(nx)) if target_idx is None else list(target_idx)
     gend = Zmat[-1, tidx].T
 
-    # Compile the endpoint, its control Jacobian, and its parameter sensitivity,
-    # JIT-compiled so the nested shoot runs in milliseconds:
+    # Compile the endpoint, its control Jacobian, and its parameter sensitivity:
     opts = {"jit": jit, "compiler": "shell",
             "jit_options": {"flags": ["-O2"]}} if jit else {}
     F_end = ca.Function("F_end_p", [U, p], [gend], opts)
@@ -55,7 +45,6 @@ def _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps=1, jit
 
     # Return the compiled parameter family (with the targeted endpoint indices):
     return dict(step=step, F_end=F_end, F_dU=F_dU, F_dp=F_dp, F_roll=F_roll, tidx=tidx)
-
 
 # A thin System-like wrapper that pins the family at one parameter value:
 class _PinnedSystem:
@@ -90,16 +79,12 @@ class _PinnedSystem:
         zt = np.asarray(z_target, float)
         return zt[self.tidx] if len(zt) == self.nx else zt
 
-
 # Run codesign over a named design parameter:
 def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
              p0, p_bounds, weights=None, substeps=1, save="figures",
              job="codesign", plot=True, target_idx=None):
 
-    # dynamics here takes (x, u, p): the design parameter appears explicitly.
-    # objective(p) is the design cost to trade against control effort.
-
-    # Build the parameter family once (optionally targeting a subset of states):
+    # Build the parameter family once:
     fam = _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps,
                               target_idx=target_idx)
     tidx = fam["tidx"]
@@ -127,11 +112,7 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
             sysp = _PinnedSystem(fam, nx, nu, N, z0, dt, p)
             U = lambda_shoot(sysp, zt, U0=U)
 
-            # Total design gradient at p: control-cost sensitivity (envelope theorem)
-            # plus the weighted design objective.  Evaluated by a helper so we can also
-            # finite-difference it for the design curvature (a damped Newton step on the
-            # scalar design converges to the true interior optimum instead of railing to
-            # a bound, which is what a plain gradient step does):
+            # Total design gradient at p:
             def design_grad(pv):
                 sp = _PinnedSystem(fam, nx, nu, N, z0, dt, pv)
                 Uv = lambda_shoot(sp, zt, U0=U)
@@ -143,21 +124,18 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
                 eps_o = 1e-6 * max(abs(p_bounds[1] - p_bounds[0]), 1e-6)
                 go = (objective(pv + eps_o) - objective(pv - eps_o)) / (2 * eps_o)
                 return gt + w * go
-
             grad = design_grad(p)
 
             # Design curvature by central finite difference (cheap: scalar parameter):
             dp = 1e-3 * max(abs(p_bounds[1] - p_bounds[0]), 1e-6)
             hess = (design_grad(p + dp) - design_grad(p - dp)) / (2 * dp)
 
-            # Damped Newton step (Levenberg): use curvature when positive, else fall back
-            # to a scaled gradient step.  Keeps the update stable and interior:
+            # Damped Newton step (Levenberg):
             p_scale = max(abs(p_bounds[1] - p_bounds[0]), 1e-9)
             if hess > 1e-9:
                 step = -grad / (hess + 1e-6)
             else:
                 step = -0.1 * p_scale * np.sign(grad)
-            # limit the step to a fraction of the parameter range for stability:
             step = float(np.clip(step, -0.5 * p_scale, 0.5 * p_scale))
             p = float(np.clip(p + step, p_bounds[0], p_bounds[1]))
 
@@ -179,7 +157,6 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
 
     # Return the selected control and the full front:
     return pick["control"], pick["param"], front
-
 
 # Plot a Pareto front of control effort versus design objective:
 def _plot_front(front, save, job):

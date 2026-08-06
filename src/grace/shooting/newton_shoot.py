@@ -3,7 +3,7 @@ import numpy as np
 from .bounds import expand_bounds, project_box, safe_solve
 
 # Newton shoot to drive the endpoint onto the target:
-def newton_shoot(system, zt, U0=None, u_lo=None, u_hi=None, it=40, tol=1e-11,
+def newton_shoot(system, zt, U0=None, it=40, tol=1e-11,
                  step_max=20.0, reg=1e-8):
 
     # Extract number of constrained states:
@@ -11,10 +11,6 @@ def newton_shoot(system, zt, U0=None, u_lo=None, u_hi=None, it=40, tol=1e-11,
 
     # Start from the supplied control, or from rest:
     U = np.zeros(system.N * system.nu) if U0 is None else np.asarray(U0, float).copy()
-
-    # Expand bounds to full trajectory and start inside the box:
-    lo, hi = expand_bounds(u_lo, u_hi, system.N, system.nu)
-    U = project_box(U, lo, hi)
 
     # Iterate the least-norm Newton correction on the endpoint residual:
     for _ in range(it):
@@ -43,7 +39,7 @@ def newton_shoot(system, zt, U0=None, u_lo=None, u_hi=None, it=40, tol=1e-11,
         # Shorten the step until it actually reduces the residual:
         moved = False
         for a in [1.0, 0.5, 0.25, 0.1, 0.05, 0.02, 0.01]:
-            Ut = project_box(U + a * dU, lo, hi)
+            Ut = U + a * dU
             et = system.endpoint(Ut)
             if np.all(np.isfinite(et)) and np.linalg.norm(et - zt) < rn:
                 U = Ut

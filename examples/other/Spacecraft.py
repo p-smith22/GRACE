@@ -3,6 +3,7 @@ import os
 import numpy as np
 import casadi as ca
 import grace
+import time
 
 # Free-flying spacecraft:
 def free_flyer(x, u):
@@ -23,7 +24,7 @@ def main():
     # Build system and GRACE engine, cached:
     system = grace.build_cached(
         free_flyer, nx=4, nu=2, N=N, z0=[0, 0, 0, 0], dt=dt,
-        job=job_name, pos_idx=(0, 1),
+        job=job_name,
     )
     engine = grace.GRACE(system)
 
@@ -32,10 +33,18 @@ def main():
     obstacle = [[15.0, 1.0], [30.0, -1.0]]
     R = 4.0
 
+    # Keep-out zones as constraints.  Each is an expression g(z, u) <= 0, with
+    # the centre and radius closed over so every lambda keeps its own:
+    constraints = [
+        (lambda z, u, o=o: R ** 2 - ((z[0] - o[0]) ** 2 + (z[1] - o[1]) ** 2))
+        for o in obstacle
+    ]
+
     # Lambda shoot for obstacle avoidance:
-    U = engine.shooting.lambda_shoot(target, obstacles=obstacle, R=R,
-                                     pos_idx=(0, 1))
+    start = time.time()
+    U = engine.shooting.lambda_shoot(target, constraints=constraints, outer=50, inner=20)
     Z = system.rollout(U)
+    print(f"OBSTACLE AVOIDANCE CASE ({time.time() - start:.2f}s): {engine.utils.diagnostics(U, target, constraints)}")
 
     # Plot:
     engine.utils.plotting(

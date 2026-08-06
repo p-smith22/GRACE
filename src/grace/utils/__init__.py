@@ -34,12 +34,12 @@ class Utils:
                                      title=title, save=save)
 
     # Compute cost, endpoint error, and stationarity of a control:
-    def diagnostics(self, control, target):
-        return _diagnostics.diagnostics(self.system, control, target)
+    def diagnostics(self, control, target, constraints=()):
+        return _diagnostics.diagnostics(self.system, control, target, constraints)
 
     # Compute the stationarity residual of a control:
-    def stationarity(self, control):
-        return _diagnostics.stationarity(self.system, control)
+    def stationarity(self, control, constraints=()):
+        return _diagnostics.stationarity(self.system, control, constraints)
 
     # Compute the minimum obstacle clearance of a control:
     def clearance(self, control, obstacles, R, pos_idx=(0, 1)):
