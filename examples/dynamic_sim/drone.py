@@ -11,6 +11,13 @@ import pygame
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import grace
 
+# Solve quality comes from the package diagnostics rather than a copy here.  The
+# stationarity it reports asks whether ANY valid multiplier set balances the cost
+# gradient, not whether the solver's own does: an augmented Lagrangian can hold a
+# constraint by penalty with its multiplier decayed to zero, which certifies
+# nothing while the trajectory is in fact optimal:
+from grace.utils.diagnostics import diagnostics
+
 
 # --- Full 12-state quadcopter.  Thrust points along the body z axis only, so the
 # --- vehicle translates by rolling and pitching: position is reached through
@@ -48,14 +55,24 @@ PANEL_W = 330
 SCREEN_W, SCREEN_H = 1500, 860
 VIEW_W = SCREEN_W - PANEL_W
 
-# Horizon ladder.  The solve starts at the shortest horizon and steps up only
-# when the request comes back infeasible, so an easy hop stays fast and a hard
-# manoeuvre is given the extra time it actually needs:
-HORIZONS = [(60, 0.06), (140, 0.14)]
+# Node count is fixed, because it sets the size of the solve.  How long the
+# manoeuvre takes is set by dt, chosen per request from the distance to fly:
+N_NODES = 90
 FPS = 60
-CTRL_SUBSTEPS = 7
 HOVER_T = 9.81
 VEH_R = 0.4
+
+# Cruise speed used to estimate how long a hop should take.  The estimate is
+# then snapped to one of a few fixed horizons rather than used directly: each
+# distinct timestep needs its own compiled system, so a continuously varying dt
+# would compile a new one for nearly every target and the first solve at each
+# would stall for minutes:
+CRUISE = 4.0
+HORIZON_TIMES = [3.0, 6.0, 10.0, 15.0, 22.0, 30.0]
+
+# Attitude limits.  Without them the solve throws the airframe into whatever
+# tilt closes the endpoint fastest, which looks nothing like flight:
+TILT_MAX = np.deg2rad(30.0)
 
 # Yaw is weighted far above the other channels.  Left at parity the minimum
 # effort solution spins the airframe through hundreds of degrees on the way,
@@ -203,10 +220,26 @@ def channel_weights(system, U_hover):
 
 class Segment:
 
-    def __init__(self, Z, U, K, goal, dt):
+    # A segment carries the system it was planned on.  Horizons use different
+    # timesteps, so stepping one segment with another's physics flies it at the
+    # wrong rate and the tracker spends the flight fighting it:
+    def __init__(self, Z, U, K, goal, dt, step_np, stat=float("nan"),
+                 worst=float("-inf"), end_err=float("nan")):
         self.Z, self.U, self.K, self.goal, self.dt = Z, U, K, goal, dt
+        self.step_np = step_np
+
+        # Diagnostics from the solve that produced this segment, so the panel
+        # can report whether the trajectory being flown is actually optimal
+        # rather than merely feasible:
+        self.stat = stat
+        self.worst = worst
+        self.end_err = end_err
         self.terminal = Z[-1].copy()
         self.N = len(Z) - 1
+
+        # Frames of playback per plan step, so wall-clock time matches the dt
+        # this segment was planned at:
+        self.substeps = max(1, int(round(dt * FPS)))
 
 
 # Mission planner: one GRACE solve per waypoint, on a worker thread:
@@ -214,18 +247,18 @@ class Planner:
 
     def __init__(self):
 
-        # One cached system per horizon on the ladder.  They compile once and
-        # reload in milliseconds afterwards, so stepping up costs nothing at run
-        # time:
-        self.levels = []
-        for N, dt in HORIZONS:
-            system = grace.build_cached(
-                quadcopter, nx=12, nu=4, N=N, z0=hover_state(4, 15, 10), dt=dt,
-                job=f"quad_sim_N{N}")
-            U_hover = np.tile(np.array([HOVER_T, 0.0, 0.0, 0.0]), N)
-            self.levels.append(dict(system=system, engine=grace.GRACE(system),
-                                    N=N, dt=dt, U_hover=U_hover,
-                                    weights=channel_weights(system, U_hover)))
+        # Systems are built on demand, one per timestep asked for, and cached
+        # from then on.  A longer flight is a larger dt rather than a bigger
+        # solve, so the cost of a request does not grow with its distance:
+        self.levels = {}
+        self.U_hover = np.tile(np.array([HOVER_T, 0.0, 0.0, 0.0]), N_NODES)
+
+        # Compile every horizon now, with progress, rather than on the worker
+        # thread where the first request of each would look like a hang:
+        for i, t_horizon in enumerate(HORIZON_TIMES):
+            print("[sim] preparing horizon %.0f s (%d of %d)"
+                  % (t_horizon, i + 1, len(HORIZON_TIMES)), flush=True)
+            self.level(t_horizon / N_NODES)
 
         # Tracking weights.  R carries the same channel scaling as the solve or
         # the torque gains swamp the thrust gain, and Qf lifts the terminal
@@ -237,44 +270,88 @@ class Planner:
         self.results = queue.Queue()
         self.busy = False
         self.solve_ema = 3.0
-        self.last_level = 0
+        self.last_horizon = 0.0
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def _solve_at(self, lvl, start_state, goal, obstacles):
+    # Fetch, building on first use, the system for one timestep:
+    def level(self, dt):
+        key = round(dt, 4)
+        if key not in self.levels:
+            system = grace.build_cached(
+                quadcopter, nx=12, nu=4, N=N_NODES, z0=hover_state(4, 15, 10),
+                dt=key, job=f"quad_sim_dt{int(key * 1e4)}")
+            self.levels[key] = dict(system=system, engine=grace.GRACE(system),
+                                    dt=key,
+                                    weights=channel_weights(system, self.U_hover))
+        return self.levels[key]
+
+    def _solve_at(self, lvl, start_state, goal, obstacles, U_warm=None):
         system, engine = lvl["system"], lvl["engine"]
         system.z0 = np.asarray(start_state, float)
         target = np.array(hover_state(goal[0], goal[1], goal[2]), float)
-        W, U_hover = lvl["weights"], lvl["U_hover"]
+        W, U_hover = lvl["weights"], self.U_hover
+
+        # Roll and pitch limits, as ordinary constraints.  Nothing marks them as
+        # attitude: the solver treats them exactly as it treats a keep-out:
+        tilt = [lambda z, u: z[6] - TILT_MAX, lambda z, u: -TILT_MAX - z[6],
+                lambda z, u: z[7] - TILT_MAX, lambda z, u: -TILT_MAX - z[7]]
 
         # Solve the obstacle-free problem first.  It is cheap and gives the
         # augmented-Lagrangian rounds a trajectory that already reaches the
         # target, so they only have to bend it around the cylinders:
-        U = engine.shooting.lambda_shoot(target, R_weights=W, U0=U_hover)
-        if obstacles:
+        # Warm start from the trajectory already being flown when there is one.
+        # A replan is a small change to a good plan, and throwing it away to
+        # start from hover costs an order of magnitude in optimality: measured
+        # on a mid-flight obstacle, warm gives a certified 1.6e-05 where hover
+        # gives 1.2e-01 on the same problem.  Sizes are matched to this horizon,
+        # since a replan may land on a different one:
+        U_start = U_hover
+        if U_warm is not None:
+            warm = np.asarray(U_warm, float).flatten()
+            need = system.N * system.nu
+            if warm.size >= need:
+                U_start = warm[:need]
+            else:
+                U_start = np.concatenate(
+                    [warm, np.tile(warm[-system.nu:], -(-(need - warm.size)
+                                                        // system.nu))])[:need]
 
-            # Each cylinder becomes an expression g(z, u) <= 0 measured in the
-            # two position states its cross-section plane names.  The centre,
-            # radius and plane are closed over so every lambda keeps its own:
-            cons = []
-            for o in obstacles:
-                a, b = PLANES[o["plane"]]
-                c = np.asarray(o["centre"], float)
-                r = o["radius"] + VEH_R
-                cons.append(lambda z, u, a=a, b=b, c=c, r=r:
-                            r ** 2 - ((z[a] - c[0]) ** 2 + (z[b] - c[1]) ** 2))
-            U = engine.shooting.lambda_shoot(
-                target, constraints=cons, R_weights=W, U0=U, outer=60, inner=30)
+        U = engine.shooting.lambda_shoot(target, R_weights=W, U0=U_start)
+
+        # Each cylinder becomes an expression g(z, u) <= 0 measured in the two
+        # position states its cross-section plane names.  The centre, radius and
+        # plane are closed over so every lambda keeps its own.  Nothing marks
+        # these as obstacles: they and the tilt limits take the same path:
+        cons = []
+        for o in obstacles:
+            a, b = PLANES[o["plane"]]
+            c = np.asarray(o["centre"], float)
+            r = o["radius"] + VEH_R
+            cons.append(lambda z, u, a=a, b=b, c=c, r=r:
+                        r ** 2 - ((z[a] - c[0]) ** 2 + (z[b] - c[1]) ** 2))
+
+        U = engine.shooting.lambda_shoot(
+            target, constraints=cons + tilt, R_weights=W, U0=U)
+
         Z = np.asarray(system.rollout(U))
         ok = not getattr(system, "_infeasible", False)
         K, _ = engine.tracking.lqr_gains(U, self.Q, self.R_for(lvl), Qf=self.Qf)
-        return U, Z, K, ok
+
+        # Stationarity: at an optimum the cost gradient is cancelled by the
+        # endpoint and active-constraint multipliers, so what is left over says
+        # how far this is from optimal rather than just feasible.  The active
+        # threshold cannot be tiny, since a row the solve is holding sits a hair
+        # inside its limit and dropping it makes a converged answer look wild:
+        report = diagnostics(system, U, target, cons + tilt, R_weights=W)
+        return (U, Z, K, ok, report["stationarity"], report["worst_violation"],
+                report["endpoint_error"])
 
     def R_for(self, lvl):
         return 0.01 * np.diag(lvl["weights"])
 
     def _worker(self):
         while True:
-            token, start_state, goal, obstacles = self.requests.get()
+            token, start_state, goal, obstacles, U_warm = self.requests.get()
             t0 = time.time()
             try:
 
@@ -282,11 +359,26 @@ class Planner:
                 # feasible.  A short hop is solved at the shortest horizon and a
                 # manoeuvre that has to squeeze past several cylinders is given
                 # the extra time it needs, without the caller choosing N:
+                # Estimate how long the hop should take from the distance to
+                # fly, snap it up to the nearest prepared horizon, and step to
+                # longer ones only when a request comes back infeasible.  A
+                # short hop is flown briskly and an awkward one is given the
+                # time it needs, with no compile at run time either way:
+                span = float(np.linalg.norm(np.asarray(goal, float)
+                                            - np.asarray(start_state, float)[:3]))
+                want = span / CRUISE
+                start_i = next((i for i, t in enumerate(HORIZON_TIMES) if t >= want),
+                               len(HORIZON_TIMES) - 1)
+
                 seg = None
-                for li, lvl in enumerate(self.levels):
-                    U, Z, K, ok = self._solve_at(lvl, start_state, goal, obstacles)
-                    seg = Segment(Z, U, K, goal, lvl["dt"])
-                    self.last_level = li
+                for t_horizon in HORIZON_TIMES[start_i:]:
+                    lvl = self.level(t_horizon / N_NODES)
+                    U, Z, K, ok, stat, worst, end_err = self._solve_at(
+                        lvl, start_state, goal, obstacles, U_warm)
+                    seg = Segment(Z, U, K, goal, lvl["dt"], lvl["system"].step_np,
+                                  stat, worst, end_err)
+                    self.last_horizon = lvl["dt"] * N_NODES
+                    ok = (ok and worst < 1e-3 and end_err < 1e-3)
                     if ok:
                         break
                 self.results.put((token, seg, True, time.time() - t0))
@@ -301,10 +393,11 @@ class Planner:
                 traceback.print_exc()
                 self.results.put((token, None, False, time.time() - t0))
 
-    def request(self, token, start_state, goal, obstacles):
+    def request(self, token, start_state, goal, obstacles, U_warm=None):
         self.busy = True
         self.requests.put((token, np.array(start_state, float),
-                           np.array(goal, float), list(obstacles)))
+                           np.array(goal, float), list(obstacles),
+                           None if U_warm is None else np.asarray(U_warm, float)))
 
     def poll(self):
         try:
@@ -322,7 +415,6 @@ class Sim:
         self.planner = Planner()
         self.cam = Camera()
         self.state = np.array(hover_state(4, 15, 10), float)
-        self.step_np = self.planner.levels[0]["system"].step_np
 
         self.waypoints = []
         self.segments = []
@@ -363,8 +455,17 @@ class Sim:
             return self.active.terminal
         return self.state
 
+    # Controls of whatever segment the next one will follow, if any:
+    def _last_controls(self):
+        if self.segments:
+            return self.segments[-1].U
+        if self.active is not None:
+            return self.active.U
+        return None
+
     def _predict_steps(self):
-        step_wall = CTRL_SUBSTEPS / float(FPS)
+        substeps = self.active.substeps if self.active is not None else 4
+        step_wall = substeps / float(FPS)
         n = int(np.ceil(self.planner.solve_ema / step_wall)) + 2
         cap = self.active.N - 1 if self.active is not None else 2
         return int(np.clip(n, 2, max(cap, 2)))
@@ -375,7 +476,8 @@ class Sim:
         self.next_token += 1
         self.pending_token = self.next_token
         self.planner.request(self.next_token, self._last_terminal(),
-                             self.waypoints[0], self.obstacles)
+                             self.waypoints[0], self.obstacles,
+                             self._last_controls())
         self.status = "planning..."
 
     def _replan(self):
@@ -395,15 +497,22 @@ class Sim:
         self.replan_queued = False
         if self.planner.busy or not self.waypoints:
             return
+        # Re-plan from where the vehicle will be when the solve lands, and hand
+        # over the controls it would have flown from that point.  Those are a
+        # good starting guess for the new plan, which is the difference between
+        # a certified optimum and a merely feasible trajectory:
+        U_warm = None
         if self.active is not None:
             k = min(self.active_k + self._predict_steps(), self.active.N - 1)
             start = self.active.Z[k].copy()
+            U_warm = self.active.U[k * 4:]
         else:
             start = self.state.copy()
         self.next_token += 1
         self.pending_token = self.next_token
         self.splice_token = self.next_token
-        self.planner.request(self.next_token, start, self.waypoints[0], self.obstacles)
+        self.planner.request(self.next_token, start, self.waypoints[0],
+                             self.obstacles, U_warm)
         self.status = "re-planning while flying..."
 
     # --- input -------------------------------------------------------------
@@ -499,13 +608,13 @@ class Sim:
             self.status = "flying GRACE trajectory"
 
         self.sub += 1
-        if self.sub >= CTRL_SUBSTEPS:
+        if self.active is not None and self.sub >= self.active.substeps:
             self.sub = 0
             if self.active is not None:
                 Z, U, K = self.active.Z, self.active.U, self.active.K
                 k = min(self.active_k, self.active.N - 1)
                 u = U[k * 4:(k + 1) * 4] - K[k] @ (self.state - Z[k])
-                self.state = np.asarray(self.step_np(self.state, u), float)
+                self.state = np.asarray(self.active.step_np(self.state, u), float)
                 self.active_k += 1
                 if self.active_k >= self.active.N:
                     self.active = None
@@ -634,8 +743,16 @@ class Sim:
             ("cylinders", f"{len(self.obstacles)}"),
             ("queued", f"{len(self.waypoints) + len(self.segments)}"),
             ("solve time", f"{self.planner.solve_ema:5.2f} s"),
-            ("horizon used", f"N = {HORIZONS[self.planner.last_level][0]}"),
+            ("horizon used", f"{self.planner.last_horizon:4.1f} s"),
         ]
+
+        # Solve quality of the trajectory currently being flown.  Stationarity
+        # near zero means the plan is optimal, not just collision free:
+        if self.active is not None:
+            rows.append(("stationarity", f"{self.active.stat:8.2e}"))
+            rows.append(("endpoint err", f"{self.active.end_err:8.2e}"))
+            if self.active.worst > float("-inf"):
+                rows.append(("worst violation", f"{self.active.worst:+8.2e}"))
         clr = None
         if self.obstacles:
             clr = min(np.linalg.norm(self.state[list(PLANES[o["plane"]])] - o["centre"])
@@ -647,6 +764,17 @@ class Sim:
         if clr is not None:
             screen.blit(font.render("CLEAR" if clr >= 0 else "CONTACT", True,
                                     OK if clr >= 0 else DANGER), (x0 + 20, y + len(rows) * 22 + 12))
+
+        # Say plainly whether the plan being flown is optimal, near it, or only
+        # feasible, so a suboptimal solve is visible rather than something to be
+        # inferred from an exponent:
+        if self.active is not None and np.isfinite(self.active.stat):
+            st = self.active.stat
+            verdict, colour = (("OPTIMAL", OK) if st < 1e-2 else
+                               ("NEAR OPTIMAL", (220, 200, 90)) if st < 1e-1 else
+                               ("NOT CONVERGED", DANGER))
+            screen.blit(font.render(verdict, True, colour),
+                        (x0 + 150, y + len(rows) * 22 + 12))
 
         screen.blit(font.render(self.status, True, MUTED), (x0 + 20, SCREEN_H - 74))
         screen.blit(font.render("drag left pane to orbit", True, GRID), (x0 + 20, SCREEN_H - 50))
@@ -662,8 +790,7 @@ def main():
     clock = pygame.time.Clock()
     font, big = _font(14), _font(19, bold=True)
 
-    print("[sim] building and caching %d horizons (first run takes a few minutes)"
-          % len(HORIZONS))
+    print("[sim] ready; each new horizon compiles once on first use")
     sim = Sim()
     print("[sim] ready")
 

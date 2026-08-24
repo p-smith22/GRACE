@@ -10,14 +10,14 @@ class Shooting:
         self.system = system
 
     # Reach a feasible endpoint by Newton feasibility steps:
-    def newton_shoot(self, target, U0=None, it=25):
+    def newton_shoot(self, target, U0=None, it=25, u_lo=None, u_hi=None):
 
         # The solver works on the reduced target, so the raw target is mapped
         # onto the constrained states here.  Everything below the shooting
         # package therefore sees only reduced targets, which keeps the
         # convention in one place instead of split across call sites:
         zt = self.system.target(target)
-        return _newton_shoot(self.system, zt, U0=U0, it=it)
+        return _newton_shoot(self.system, zt, U0=U0, it=it, u_lo=u_lo, u_hi=u_hi)
 
     # Lambda shoot for optimal control:
     def lambda_shoot(self, target, constraints=(), U0=None, max_it=None,

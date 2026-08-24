@@ -28,7 +28,7 @@ def main():
     # Build system and engine (and cache):
     system = grace.build_cached(
         quadrotor, nx=6, nu=2, N=N, z0=[0, 0, 0, 0, 0, 0], dt=dt,
-        job=job_name,
+        job=job_name
     )
     engine = grace.GRACE(system)
 
@@ -73,10 +73,10 @@ def main():
     # === CODESIGN ===
     # Perform codesign on thrust gain (but penalize its use for conflicting objectives):
     codesign = grace.Codesign(quadrotor_p, nx=6, nu=2, N=N, z0=[0, 0, 0, 0, 0, 0], dt=0.05)
-    U_cd, p_opt, front = codesign.optimize(
-        target=target, param_name="p", objective=lambda p: 2000.0 * (p - 1.0) ** 2,
-        p0=1.0, p_bounds=(0.5, 2.0), weights=np.linspace(0, 3, 6),
-        save=f'figures/{job_name}/codesign.png')
+    U_cd, p_opt, front, sweep = codesign.optimize(
+        target=target, param_name="p", objective=lambda p: 100 + 2000.0 * (p - 1.0) ** 2,
+        p0=1.25, p_bounds=(0.5, 2.0), weights=np.linspace(0, 3, 50),
+        save=f'figures/{job_name}/codesign.png', debug=True)
 
     # Print optimal thrust gain:
     gains_swept = [round(fp["param"], 2) for fp in front]
