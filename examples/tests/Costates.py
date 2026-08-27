@@ -120,7 +120,7 @@ if __name__ == "__main__":
 
     # GRACE nominal, unconstrained so the PMP conditions are clean:
     t0 = time.perf_counter()
-    system = grace.build_cached(dynamics, nx=NX, nu=NU, N=N, z0=Z0, dt=DT,
+    system = grace.build(dynamics, nx=NX, nu=NU, N=N, z0=Z0, dt=DT,
                          job="costate")
     engine = grace.GRACE(system)
     t_build_gr = time.perf_counter() - t0
@@ -185,15 +185,27 @@ if __name__ == "__main__":
 
     # === PLOTS ===
     t = np.arange(N + 1) * DT
-    fig, ax = plt.subplots(1, 4, figsize=(21, 4.6))
+    fig, ax = plt.subplots(1, 3, figsize=(16.5, 4.6))
 
-    # Costate trajectories from the adjoint recursion:
+    # Every costate the three methods produce, on one axis.
+    #
+    #   lines   GRACE: the terminal costate comes straight out of the Gramian
+    #           solve, and the interior from the adjoint recursion run back
+    #           through the linearizations
+    #   dots    IPOPT transcription: the multipliers on the per node dynamics
+    #           defects are the interior costates, same sign, no recursion
+    #   crosses IPOPT single shooting: only the terminal one is available, as
+    #           the multiplier on the endpoint constraint, with mu = -lam
     names = ["x", "y", "th", "vx", "vy", "om"]
     for j in range(NX):
-        ax[0].plot(t, lam[:, j], lw=1.6, label=f"$\\lambda_{{{names[j]}}}$")
+        ax[0].plot(t, lam[:, j], "-", lw=1.6, color=f"C{j}",
+                   label=f"$\\lambda_{{{names[j]}}}$")
+        ax[0].plot(t[1:], nu_tr[:, j], "o", ms=3.5, color=f"C{j}", alpha=0.55)
+        ax[0].plot(t[-1], -mu_ip[j], "x", ms=9, mew=2.0, color=f"C{j}")
     ax[0].set_xlabel("time [s]")
     ax[0].set_ylabel("costate")
-    ax[0].set_title("Costate trajectories (adjoint recursion)")
+    ax[0].set_title("GRACE (lines), transcription duals (dots),\n"
+                    f"single shooting terminal (x) -- max rel diff {d_int:.1e}")
     ax[0].legend(fontsize=8, ncol=2)
     ax[0].grid(alpha=0.3)
 
@@ -229,20 +241,8 @@ if __name__ == "__main__":
     ax[2].legend(fontsize=9)
     ax[2].grid(alpha=0.3, axis="y")
 
-    # Interior costates: adjoint recursion against transcription multipliers:
-    for j in range(NX):
-        ax[3].plot(t[1:], lam[1:, j], "-", lw=1.6, color=f"C{j}",
-                   label=f"$\\lambda_{{{names[j]}}}$")
-        ax[3].plot(t[1:], nu_tr[:, j], "o", ms=3, color=f"C{j}", alpha=0.6)
-    ax[3].set_xlabel("time [s]")
-    ax[3].set_ylabel("costate")
-    ax[3].set_title(f"Adjoint (lines) vs transcription duals (dots)\n"
-                    f"max rel diff {d_int:.1e}")
-    ax[3].legend(fontsize=7, ncol=2)
-    ax[3].grid(alpha=0.3)
-
     fig.tight_layout()
-    fig.savefig("figures/costate_comparison.png", dpi=140, bbox_inches="tight")
+    fig.savefig("figures/tests/costate_comparison.png", dpi=140, bbox_inches="tight")
     # === TIMING ===
     # Costate construction is one nx x nx solve on top of the shoot, so it is
     # reported separately from the trajectory solve:
@@ -264,4 +264,4 @@ if __name__ == "__main__":
     print(f"total speedup vs single shooting : "
           f"{(t_b_ss + t_s_ss) / max(t_build_gr + tg, 1e-12):.2f}x")
 
-    print("\nsaved figures/costate_comparison.png")
+    print("\nsaved figures/tests/costate_comparison.png")

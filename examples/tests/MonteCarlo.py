@@ -38,6 +38,7 @@ TARGET = np.array([5.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 # Constraint expression: positive inside the disc, so g(z, u) <= 0 clears it:
 keep_out = lambda z, u: R_OBS ** 2 - ((z[0] - OBS[0]) ** 2 + (z[1] - OBS[1]) ** 2)
 
+
 # === MONTE CARLO SETTINGS ===
 N_TRIALS = 300
 SIG_W = np.array([0.0, 0.0, 0.0, 0.03, 0.03, 0.02])
@@ -152,5 +153,5 @@ if __name__ == "__main__":
     ax[2].grid(alpha=0.3, axis="y")
 
     fig.tight_layout()
-    fig.savefig("figures/lqr_montecarlo.png", dpi=140, bbox_inches="tight")
-    print("\nsaved figures/lqr_montecarlo.png")
+    fig.savefig("figures/tests/lqr_mc.png", dpi=140, bbox_inches="tight")
+    print("\nsaved figures/tests/lqr_mc.png")

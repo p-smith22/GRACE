@@ -1,5 +1,6 @@
 # Import packages:
 import numpy as np
+from scipy.optimize import root
 import casadi as ca
 from .newton_shoot import newton_shoot
 from .bounds import expand_weights, weighted_cost, weighted_cost_grad, safe_solve
@@ -179,10 +180,79 @@ def _break_symmetry(system, con, U, n_dof, rounds=6):
     return U
 
 
+# Minimum-effort step from per-node linearizations, without the composed Jacobian:
+def _recursive_step(system, U, zt, R_N_inv, reg, m, tidx):
+
+    # One linearization per node, differentiating a single RK4 step N times
+    # rather than differentiating through the whole composed rollout:
+    Z, A, B = system.node_jac(U)
+    N, nu, nx = system.N, system.nu, system.nx
+    e = np.asarray(Z)[-1][tidx]
+    delta = e - zt
+
+    # Backward sweep. P carries the state transition from node k+1 to the end,
+    # so P @ B_k is the k-th block of the endpoint Jacobian and the sum below is
+    # the weighted output controllability Gramian, formed without ever storing
+    # that Jacobian:
+    W = np.zeros((m, m))
+    CoV = np.zeros(m)
+    P = np.eye(m)
+    for k in range(N - 1, -1, -1):
+        Bk = B[:, k * nu:(k + 1) * nu][tidx]
+        Rk = R_N_inv[k * nu:(k + 1) * nu]
+        M = P @ Bk
+        W += (M * Rk) @ M.T
+        CoV += M @ (Rk * U[k * nu:(k + 1) * nu])
+        P = P @ A[:, k * nx:(k + 1) * nx][np.ix_(tidx, tidx)]
+
+    # Endpoint multiplier, the terminal costate of the minimum-effort problem:
+    lam = safe_solve(W + reg * np.eye(m), CoV - delta)
+
+    # Adjoint vector sweep for Co^T lam, one matrix-vector product per node:
+    dU = np.empty(N * nu)
+    p = lam.copy()
+    for k in range(N - 1, -1, -1):
+        Bk = B[:, k * nu:(k + 1) * nu][tidx]
+        Rk = R_N_inv[k * nu:(k + 1) * nu]
+        dU[k * nu:(k + 1) * nu] = -(U[k * nu:(k + 1) * nu] - Rk * (Bk.T @ p))
+        p = A[:, k * nx:(k + 1) * nx][np.ix_(tidx, tidx)].T @ p
+    return e, delta, lam, dU
+
+
 # Minimum-effort shoot to a target, subject to inequality constraints:
 def lambda_shoot(system, z_target, constraints=(), U0=None, R_weights=None,
                  max_it=1200, ftol=1e-6, outer=25, inner=10, polish=40,
-                 end_tol=1e-3):
+                 end_tol=1e-3, nx_recursive=16, cost=None):
+
+    # cost is a pair of callables (f, dinv) replacing the quadratic control
+    # weight with any convex separable cost, sum_k f_k(u_k):
+    #
+    #     f(U)     the cost of a control history
+    #     dinv(s)  the inverse of the marginal cost, (f')^-1, elementwise
+    #
+    # Stationarity of the quadratic problem gives U = R^-1 Co' lam, control
+    # linear in the endpoint costate. That map is the only place the cost
+    # enters, and for a general cost it becomes
+    #
+    #     u_k = dinv( (Co' lam)_k )
+    #
+    # with lam still solving m equations built from the same endpoint Jacobian.
+    # Everything around it -- trust region, Anderson blend, Jacobian refresh --
+    # deals with the nonlinearity of Co and is untouched.
+    if cost is not None:
+        # A cost may supply the derivative of its inverse map as a third
+        # entry. Without it the solver finite differences, which costs two
+        # extra inversions per element and is usually the dominant cost.
+        f_cost, f_dinv = cost[0], cost[1]
+        f_dprime = cost[2] if len(cost) > 2 else None
+        if constraints:
+            raise NotImplementedError(
+                "a general cost is not yet combined with inequality "
+                "constraints: the active-set path folds the control weight "
+                "into an effective inverse that assumes the cost is quadratic")
+        if R_weights is not None:
+            raise ValueError("R_weights and cost both set the control cost; "
+                             "put the weights inside the cost")
 
     # Solver settings, swept across twelve systems and insensitive to all of them:
     reg = 1e-10
@@ -219,6 +289,15 @@ def lambda_shoot(system, z_target, constraints=(), U0=None, R_weights=None,
         con = hit
     else:
         con = None
+
+    # The recursion beats the composed Jacobian once the state dimension is
+    # large enough for the per-node linearizations to pay for themselves. It
+    # applies only to the unconstrained path, where the control weight is not
+    # deformed by active rows:
+    # The recursion assumes a diagonal quadratic weight when it accumulates
+    # the Gramian, so a general cost takes the dense path:
+    use_rec = (con is None and cost is None and m >= nx_recursive
+               and hasattr(system, "node_jac"))
 
     # Newton shoot for a feasible control sequence, then off any saddle:
     U = newton_shoot(system, zt, U0)
@@ -275,91 +354,234 @@ def lambda_shoot(system, z_target, constraints=(), U0=None, R_weights=None,
         U_jac = U.copy()
         stale = False
         blend = 1.0
-        prev_step = np.inf
+        lam_prev = None
+
+        # What the merit test charges for control. The globalization below is
+        # shared, so this is the only place it has to know which cost is in use.
+        cost_of = (f_cost if cost is not None
+                   else (lambda V: weighted_cost(V, r_diag)))
 
         # Inner rounds, minimizing the subproblem at the current multipliers:
         for inner_it in range(inner if con is not None else max_it):
             if not np.all(np.isfinite(U)):
                 U = U_best
                 break
-            e, Co = system.endpoint_jac(U)
-            if not np.all(np.isfinite(e)):
-                U = U_best
-                break
-            delta = e - zt
-
-            # Cost gradient, with the active constraint rows folded in:
-            g = weighted_cost_grad(U, r_diag)
-            G = np.zeros((0, n_dof))
-            if con is not None:
-                h, _ = evaluate(U)
-                eta = np.maximum(0.0, mu + rho * h)
-
-                # A row on its limit counts even once its multiplier has decayed:
-                act = np.where((eta > 0.0) | (h > -tol_act))[0]
-
-                # Only the active rows enter the step:
-                if act.size:
-
-                    # The Jacobian is stale once the trajectory has drifted from it:
-                    drift = np.linalg.norm(U - U_jac)
-                    if held is None or stale or \
-                            drift > jac_tol * max(np.linalg.norm(U), 1.0):
-                        _, held = evaluate(U, want_jac=True)
-                        U_jac = U.copy()
-                        stale = False
-                    g = g + eta[act] @ held[act]
-                    G = held[act]
-
-            # Active rows deform the control weight to R_eff = R_N + rho G'G:
-            if G.shape[0]:
-                n_act = G.shape[0]
-                M_act = np.eye(n_act) / rho + (G * R_N_inv) @ G.T \
-                    + 1e-12 * np.eye(n_act)
-
-                # Woodbury, so the solve is the size of the active set:
-                def apply_R_eff_inv(V, G=G, M_act=M_act):
-                    corr = G.T @ safe_solve(M_act, (G * R_N_inv) @ V)
-                    return (R_N_inv[:, None] * (V - corr)) if V.ndim > 1 \
-                        else R_N_inv * (V - corr)
+            if use_rec:
+                e, delta, lam, dU = _recursive_step(system, U, zt, R_N_inv,
+                                                    reg, m, tidx)
+                if not np.all(np.isfinite(e)):
+                    U = U_best
+                    break
+                step_norm = np.linalg.norm(dU)
+                if not np.isfinite(step_norm):
+                    U = U_best
+                    break
+                sigma = 2.0 * float(np.max(np.abs(lam))) + 1.0
+                if step_norm < best_step:
+                    best_step = step_norm
+                    U_best = U.copy()
+                if step_norm < ftol * max(np.linalg.norm(U), 1.0):
+                    break
+                g = weighted_cost_grad(U, r_diag)
             else:
+                e, Co = system.endpoint_jac(U)
+                if not np.all(np.isfinite(e)):
+                    U = U_best
+                    break
+                delta = e - zt
 
-                # No active rows, so the weight is R_N itself:
-                def apply_R_eff_inv(V):
-                    return (R_N_inv[:, None] * V) if V.ndim > 1 else R_N_inv * V
+                # Cost gradient, with the active constraint rows folded in:
+                g = weighted_cost_grad(U, r_diag)
+                G = np.zeros((0, n_dof))
+                if con is not None:
+                    h, _ = evaluate(U)
+                    eta = np.maximum(0.0, mu + rho * h)
 
-            # Weighted output controllability Gramian and the lambda step:
-            R_inv_Co = apply_R_eff_inv(Co.T)
-            W_R = Co @ R_inv_Co + reg * np.eye(m)
-            R_inv_grad = apply_R_eff_inv(g)
-            lam = safe_solve(W_R, Co @ R_inv_grad - delta)
-            dU = -(R_inv_grad - R_inv_Co @ lam)
-            step_norm = np.linalg.norm(dU)
-            if not np.isfinite(step_norm):
-                U = U_best
-                break
+                    # A row on its limit counts even once its multiplier has decayed:
+                    act = np.where((eta > 0.0) | (h > -tol_act))[0]
 
-            # An exact penalty needs a weight above the endpoint multiplier:
-            sigma = 2.0 * float(np.max(np.abs(lam))) + 1.0
+                    # Only the active rows enter the step:
+                    if act.size:
 
-            # Track the shortest step, and stop once it is small enough:
-            if step_norm < best_step:
-                best_step = step_norm
-                U_best = U.copy()
-            if step_norm < ftol * max(np.linalg.norm(U), 1.0):
-                break
+                        # The Jacobian is stale once the trajectory has drifted from it:
+                        drift = np.linalg.norm(U - U_jac)
+                        if held is None or stale or \
+                                drift > jac_tol * max(np.linalg.norm(U), 1.0):
+                            _, held = evaluate(U, want_jac=True)
+                            U_jac = U.copy()
+                            stale = False
+                        g = g + eta[act] @ held[act]
+                        G = held[act]
 
-            # Unconstrained, the step is a fixed-point map that barely contracts:
+                # Active rows deform the control weight to R_eff = R_N + rho G'G:
+                if G.shape[0]:
+                    n_act = G.shape[0]
+                    M_act = np.eye(n_act) / rho + (G * R_N_inv) @ G.T \
+                        + 1e-12 * np.eye(n_act)
+
+                    # Woodbury, so the solve is the size of the active set:
+                    def apply_R_eff_inv(V, G=G, M_act=M_act):
+                        corr = G.T @ safe_solve(M_act, (G * R_N_inv) @ V)
+                        return (R_N_inv[:, None] * (V - corr)) if V.ndim > 1 \
+                            else R_N_inv * (V - corr)
+                else:
+
+                    # No active rows, so the weight is R_N itself:
+                    def apply_R_eff_inv(V):
+                        return (R_N_inv[:, None] * V) if V.ndim > 1 else R_N_inv * V
+
+                # Weighted output controllability Gramian and the lambda step:
+                R_inv_Co = apply_R_eff_inv(Co.T)
+                # General cost: solve the same m equations for lam, with the
+                # costate mapped through the cost's marginal inverse instead of
+                # through R^-1. The target is where the linearized endpoint
+                # would have to land, Co U - delta.
+                if cost is not None:
+
+                    # Where the linearized endpoint has to land:
+                    d_tgt = Co @ U - delta
+
+                    # Solve Co dinv(Co' lam) = d_tgt for lam. The unknown has
+                    # one entry per constrained output, not one per control, so
+                    # this stays small however long the horizon is. Seeded from
+                    # the quadratic solution and warm started thereafter.
+                    if lam_prev is None:
+                        lam_prev = safe_solve(Co @ Co.T + reg * np.eye(m),
+                                              2.0 * d_tgt)
+
+                        # A cost with a threshold gives no control at all until
+                        # the costate clears it, and the quadratic seed can sit
+                        # well below that. Started there the map is flat, the
+                        # root find has nothing to descend, and it settles for
+                        # whichever feasible point it stumbles into. Scaling the
+                        # seed up until the map responds costs a few evaluations
+                        # and puts the solve in the right basin.
+                        for _ in range(80):
+                            if np.linalg.norm(f_dinv(Co.T @ lam_prev)) > 1e-6:
+                                break
+                            lam_prev = lam_prev * 2.0
+
+                    def _res(L):
+                        return Co @ f_dinv(Co.T @ L) - d_tgt
+
+                    def _jac(L):
+                        s_ = Co.T @ L
+                        if f_dprime is not None:
+                            dp = f_dprime(s_)
+                        else:
+                            h_ = 1e-6 * (1.0 + np.abs(s_))
+                            dp = (f_dinv(s_ + h_)
+                                  - f_dinv(s_ - h_)) / (2.0 * h_)
+                        return Co @ (dp[:, None] * Co.T)
+
+                    # Walk out to the target rather than jumping to it. From a
+                    # standing start the whole endpoint has to be produced in
+                    # one solve, across a threshold the seed sits below, and a
+                    # Newton method has no reason to find it. Each step here
+                    # starts from the multiplier that solved the last.
+                    lam = lam_prev
+                    ok_dual = False
+                    for frac in (0.25, 0.5, 1.0):
+                        sol = root(lambda L, fr=frac:
+                                   Co @ f_dinv(Co.T @ L) - fr * d_tgt,
+                                   lam, jac=_jac, method="hybr")
+                        lam = sol.x
+                    if np.all(np.isfinite(lam)):
+                        ok_dual = (np.linalg.norm(_res(lam))
+                                   <= 1e-6 * max(1.0, np.linalg.norm(d_tgt)))
+
+                    if ok_dual:
+                        lam_prev = lam
+                        U_new = f_dinv(Co.T @ lam)
+                    else:
+                        # The dual solve did not land. That is a failure of this
+                        # iteration, not of the problem: take the quadratic step
+                        # instead, which is always available, and try again next
+                        # time from somewhere better. Breaking out here leaves
+                        # the answer wherever the iterate happened to be, which
+                        # is feasible and not optimal.
+                        W_q = Co @ Co.T + reg * np.eye(m)
+                        lam = safe_solve(W_q, 2.0 * d_tgt)
+                        U_new = Co.T @ lam / 2.0
+
+                    if not np.all(np.isfinite(U_new)):
+                        U = U_best
+                        break
+
+                    dU = U_new - U
+                    step_norm = np.linalg.norm(dU)
+                    if step_norm < best_step:
+                        best_step = step_norm
+                        U_best = U.copy()
+
+                    # A small step is convergence only if the endpoint is
+                    # actually met. A cost with a deadband returns zero control
+                    # wherever the costate is below the threshold, so starting
+                    # from zero it can hand back a step of zero on the first
+                    # pass -- the iterate has not moved, and without this test
+                    # the solver reads that as having arrived.
+                    if (step_norm < ftol * max(np.linalg.norm(U), 1.0)
+                            and np.linalg.norm(delta) < end_tol):
+                        break
+
+                    # Nothing moved and the endpoint is still wrong, so the
+                    # deadband is holding every channel shut. Push the costate
+                    # up until it clears the threshold somewhere.
+                    if step_norm < 1e-14 * max(np.linalg.norm(U), 1.0):
+                        for _ in range(60):
+                            lam_prev = lam_prev * 2.0
+                            U_new = f_dinv(Co.T @ lam_prev)
+                            if np.linalg.norm(U_new - U) > 1e-9:
+                                break
+                        dU = U_new - U
+                        step_norm = np.linalg.norm(dU)
+                        if step_norm < 1e-14:
+                            U = U_best
+                            break
+
+                    # An exact penalty needs a weight above the endpoint
+                    # multiplier, same as the quadratic path:
+                    sigma = 2.0 * float(np.max(np.abs(lam))) + 1.0
+
+                else:
+                    W_R = Co @ R_inv_Co + reg * np.eye(m)
+                    R_inv_grad = apply_R_eff_inv(g)
+
+                    # Solve for lambda in symmetrically scaled coordinates. The
+                    # constrained states differ enormously in natural scale, and an early
+                    # control acts on the endpoint for the whole remaining horizon, so
+                    # the diagonal spread of W_R grows with N and costs accuracy in this
+                    # solve. Scaling it out leaves the same system but its conditioning
+                    # stops depending on the horizon length.
+                    d_W = 1.0 / np.sqrt(np.maximum(np.diag(W_R), 1e-300))
+                    W_s = (W_R * d_W[:, None]) * d_W[None, :]
+                    lam = safe_solve(W_s, (Co @ R_inv_grad - delta) * d_W) * d_W
+                    dU = -(R_inv_grad - R_inv_Co @ lam)
+                    step_norm = np.linalg.norm(dU)
+                    if not np.isfinite(step_norm):
+                        U = U_best
+                        break
+
+                    # An exact penalty needs a weight above the endpoint multiplier:
+                    sigma = 2.0 * float(np.max(np.abs(lam))) + 1.0
+
+                    # Track the shortest step, and stop once it is small enough:
+                    if step_norm < best_step:
+                        best_step = step_norm
+                        U_best = U.copy()
+                    if step_norm < ftol * max(np.linalg.norm(U), 1.0):
+                        break
+
+            # Unconstrained, the fixed-point map barely contracts, so Anderson
+            # extrapolates it. The damping is judged on whether a step reduced
+            # the exact-penalty merit, not on whether the step norm grew: on a
+            # long horizon the Gauss-Newton step norm rises on roughly half the
+            # iterations, and shrinking on each rise drives the blend to its
+            # floor and stalls the solve short of stationarity.
             if con is None:
 
-                # A growing step means the extrapolation has failed, so restart it:
-                if step_norm > prev_step:
-                    hist_U.clear()
-                    hist_F.clear()
-                    blend = max(blend * 0.5, 1e-3)
-                else:
-                    blend = min(blend * 1.2, 1.0)
-                prev_step = step_norm
+                # Merit before the step, at a weight above the endpoint multiplier:
+                merit0 = cost_of(U) + sigma * np.linalg.norm(delta)
 
                 # Keep the last few residuals:
                 hist_U.append(U.copy())
@@ -390,14 +612,34 @@ def lambda_shoot(system, z_target, constraints=(), U0=None, R_weights=None,
                         np.linalg.norm(U_new - U) > 50.0 * max(step_norm, 1e-12):
                     hist_U.clear()
                     hist_F.clear()
-                    blend = max(blend * 0.5, 1e-3)
                     U_new = U + blend * dU
+
+                # Merit after, deciding both the iterate and the damping:
+                def _merit(V):
+                    Z_v = system.rollout(V)
+                    if not np.all(np.isfinite(Z_v)):
+                        return np.inf
+                    return cost_of(V) \
+                        + sigma * np.linalg.norm(Z_v[-1][tidx] - zt)
+
+                if _merit(U_new) < merit0:
+                    U = U_new
+                    blend = min(blend * 1.3, 1.0)
+                else:
+
+                    # The extrapolation did not help, so restart it and retry
+                    # the plain step at half the damping:
+                    hist_U.clear()
+                    hist_F.clear()
+                    blend = max(blend * 0.5, 1e-3)
+                    U_try = U + blend * dU
+                    if _merit(U_try) < merit0:
+                        U = U_try
 
                 # Optional trace of the damping schedule:
                 if getattr(system, "_count_ls", False):
                     print("[shoot] it %4d  blend %8.3g  step %9.3e"
                           % (inner_it, blend, step_norm))
-                U = U_new
                 continue
 
             # Merit at the current iterate:

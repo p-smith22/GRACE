@@ -4,17 +4,21 @@ import hashlib
 import numpy as np
 from ..shooting.bounds import safe_solve
 import casadi as ca
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize
 from ..shooting.lambda_shoot import lambda_shoot
 
 # Build a parameterized system family and its parameter-sensitivity rollout:
 def _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps=1, jit=True,
-                        target_idx=None, jit_flags="-O1", cache_dir=".grace_cache"):
+                        target_idx=None, jit_flags="-O1", cache_dir=".grace_cache",
+                        n_param=1):
 
-    # Symbolic state, control, and the named design parameter:
+    # Symbolic state, control, and the design parameters. n_param is one for a
+    # scalar design and more when several are sized together; nothing else in
+    # the construction changes, since the parameter only ever enters through
+    # the dynamics.
     z = ca.MX.sym("z", nx)
     u = ca.MX.sym("u", nu)
-    p = ca.MX.sym(param_name, 1)
+    p = ca.MX.sym(param_name, n_param)
 
     # Integrate one control period with RK4, carrying the parameter:
     h = dt / substeps
@@ -49,7 +53,7 @@ def _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps=1, jit
     # The expression graph fully determines the generated code, so hash it: an
     # unchanged problem reuses the shared library instead of recompiling.
     if jit:
-        sig = f"{str(gend)}|{str(Zmat)}|{jit_flags}"
+        sig = f"{str(gend)}|{str(Zmat)}|{jit_flags}|{n_param}"
         key = hashlib.sha1(sig.encode()).hexdigest()[:16]
         os.makedirs(cache_dir, exist_ok=True)
         stem = f"fam_{key}"
@@ -97,7 +101,7 @@ class _PinnedSystem:
         self.tidx = fam.get("tidx", list(range(nx)))
         self.m = len(self.tidx)
         self.pos_jac = None
-        self.pval = pval
+        self.pval = np.atleast_1d(np.asarray(pval, float))
         self._count_iters = False
         self._plain_step = False
 
@@ -154,6 +158,251 @@ def scan(dynamics, nx, nu, N, z0, dt, target, param_name, objective, p_values,
     return front
 
 # Run codesign over a named design parameter:
+def _codesign_vector(fam, tidx, nx, nu, N, z0, dt, target, objective,
+                     p0, p_bounds, weights, norm, rho, p_tol, max_outer,
+                     save, job, plot, n_anchor, debug_vec=True):
+
+    # Several design parameters at once. The inner solve is unchanged -- an
+    # exact minimum-effort shoot at each candidate design -- and the design
+    # gradient comes from the costate it already produces:
+    #
+    #     dC*/dp = -lam' (de/dp)
+    #
+    # At the inner optimum the control is stationary, so a design perturbation
+    # only moves the endpoint constraint and the control's own contribution
+    # drops out. Nothing is differentiated through the solve.
+    lo = np.array([b[0] for b in p_bounds], float)
+    hi = np.array([b[1] for b in p_bounds], float)
+    zt = np.asarray(target, float)[tidx]
+    weights = np.linspace(0.0, 1.0, 11) if weights is None else np.asarray(weights)
+
+    # Warm starts kept per design and chosen by nearest neighbour. The outer
+    # solve does not walk smoothly through the design space -- a line search
+    # can jump and come back -- so the last design evaluated is often not a
+    # near neighbour of the next, and a control history optimal for a different
+    # vehicle costs more to correct than it saves.
+    warm = {"pts": []}
+    stats = {"solves": 0}
+    span = np.maximum(hi - lo, 1e-12)
+
+    def _warm_for(p):
+        if not warm["pts"]:
+            return None
+        P = np.array([q for q, _ in warm["pts"]])
+        k = int(np.argmin(np.linalg.norm((P - p) / span, axis=1)))
+        return warm["pts"][k][1] if \
+            np.linalg.norm((P[k] - p) / span) < 0.15 else None
+
+    def inner(p, ftol=1e-7, max_it=400):
+        pc = np.clip(p, lo, hi)
+        sysp = _PinnedSystem(fam, nx, nu, N, z0, dt, pc)
+
+        # Tolerance matters more than it looks during the search. The outer
+        # solve is an SQP reading the inner cost through a constraint; a
+        # loosely converged inner solve makes that constraint noisy, and an SQP
+        # responds to noise by deciding it has converged.
+        #
+        # The anchor sweep is different. It only places the ideal and nadir
+        # points the weights are normalized against, which needs two digits and
+        # not seven, so it passes a loose tolerance and is much cheaper.
+        U = np.asarray(lambda_shoot(sysp, zt, U0=_warm_for(pc),
+                                    ftol=ftol, max_it=max_it)).flatten()
+        stats["solves"] += 1
+        warm["pts"].append((pc.copy(), U.copy()))
+        return sysp, U
+
+    def cost_and_grad(p, **kw):
+        pc = np.clip(p, lo, hi)
+        sysp, U = inner(pc, **kw)
+        _, Co = sysp.endpoint_jac(U)
+        m = Co.shape[0]
+        lam = np.linalg.solve(Co @ Co.T + 1e-12 * np.eye(m), Co @ (2.0 * U))
+        dgp = np.array(fam["F_dp"](U, pc)).reshape(m, -1)
+        return float(U @ U), -(dgp.T @ lam), U
+
+    # Anchor sweep, to place the ideal and nadir points the weights are
+    # normalized against. The scalar path can sweep a dense grid because the
+    # design is one number; in several dimensions a grid is out of reach and a
+    # handful of corners is not enough -- a misplaced nadir makes one objective
+    # negligible at every weight, and the whole front collapses onto a point.
+    #
+    # A scrambled low discrepancy sample covers the box far more evenly than
+    # random points at this count, and the corners and the starting design are
+    # included because the extremes of both objectives usually sit there.
+    # Sobol is balanced only at powers of two, so the count is rounded to one:
+    # Enough to place the ideal and nadir in a few dimensions without turning
+    # the sweep into the dominant cost. Rounded to a power of two, which is
+    # where Sobol is balanced.
+    n_s = int(2 ** np.ceil(np.log2(max(8 * len(lo), 16))))
+    try:
+        from scipy.stats import qmc
+        pts = qmc.Sobol(d=len(lo), scramble=True, seed=0).random(n_s)
+    except Exception:
+        pts = np.random.default_rng(0).random((n_s, len(lo)))
+    anchors = [p0, lo.copy(), hi.copy()]
+    anchors += [lo + q * (hi - lo) for q in pts]
+    for i in range(len(lo)):
+        a = p0.copy()
+        a[i] = lo[i]
+        anchors.append(a)
+        b = p0.copy()
+        b[i] = hi[i]
+        anchors.append(b)
+    Cg = np.array([cost_and_grad(a, ftol=1e-3, max_it=120)[0]
+                   for a in anchors])
+    Dg = np.array([float(objective(a)) for a in anchors])
+
+    # Ideal and nadir, the same construction the scalar path uses. The nadir is
+    # the cost at the design that minimizes the other objective, not the worst
+    # cost anywhere in the sweep: a single poor anchor would otherwise set a
+    # range so wide that the normalized cost is negligible at every sensible
+    # design, the other term dominates at every weight, and the front collapses
+    # to a point.
+    C_id = Cg.min() - 0.01 * np.ptp(Cg)
+    D_id = Dg.min() - 0.01 * np.ptp(Dg)
+    C_rng = max(Cg[int(np.argmin(Dg))] - C_id, 1e-12)
+    D_rng = max(Dg[int(np.argmin(Cg))] - D_id, 1e-12)
+
+    h = 1e-6
+
+    # Memoized, because an SQP asks for the objective, its gradient, the
+    # constraints and their Jacobian as four separate calls at the same point,
+    # and each would otherwise repeat the inner solve underneath. Caching turns
+    # four solves per iteration into one, and the line search reuses points as
+    # well.
+    _pcache = {}
+
+    def parts(p):
+        # Rounded finely enough to catch a repeated evaluation and no finer.
+        # A coarse key makes nearby points return identical values, which a
+        # line search reads as a flat spot and probes until it gives up; the
+        # tolerance below is well inside the inner solve's own accuracy.
+        key = tuple(np.round(np.clip(p, lo, hi), 12))
+        if key in _pcache:
+            return _pcache[key]
+
+        C, dC, _ = cost_and_grad(np.asarray(key))
+        D = float(objective(np.asarray(key)))
+        dD = np.array([(float(objective(np.clip(np.asarray(key) + h * e,
+                                                lo, hi))) - D) / h
+                       for e in np.eye(len(p))])
+        out = ((C - C_id) / C_rng, dC / C_rng,
+               (D - D_id) / D_rng, dD / D_rng)
+        _pcache[key] = out
+        return out
+
+    if debug_vec:
+        print(f"[codesign] normalization: C_id {C_id:.4g} C_rng {C_rng:.4g}, "
+              f"D_id {D_id:.4g} D_rng {D_rng:.4g}")
+        print(f"[codesign] anchors: C in [{Cg.min():.4g}, {Cg.max():.4g}], "
+              f"D in [{Dg.min():.4g}, {Dg.max():.4g}]")
+        print(f"{'w':>6}{'design':>34}{'Chat':>10}{'Dhat':>10}"
+              f"{'w1*Chat':>10}{'w2*Dhat':>10}{'nit':>5}{'ok':>4}")
+
+    front = []
+    p_cur = p0.copy()
+    for w in weights:
+        w1, w2 = 1.0 - float(w), float(w)
+
+        if norm in ("l1", "l2"):
+            def fg(p):
+                Ch, gC, Dh, gD = parts(p)
+                if norm == "l1":
+                    return w1 * Ch + w2 * Dh, w1 * gC + w2 * gD
+                return ((w1 * Ch) ** 2 + (w2 * Dh) ** 2,
+                        2.0 * (w1 ** 2 * Ch * gC + w2 ** 2 * Dh * gD))
+
+            r = minimize(fg, p0.copy(), jac=True, method="L-BFGS-B",
+                         bounds=list(zip(lo, hi)),
+                         options=dict(maxiter=max_outer, ftol=1e-12,
+                                      gtol=1e-10))
+            p_cur = np.clip(r.x, lo, hi)
+
+        else:
+            # Chebyshev in epigraph form: minimize t subject to t >= w1*Chat
+            # and t >= w2*Dhat. The maximum of two terms has no gradient where
+            # they cross, and that crossing is exactly where the optimum sits,
+            # so a smoothed maximum either stalls a gradient method or moves
+            # the answer. The epigraph is exact and leaves the nonsmoothness in
+            # the constraints, where an SQP handles it.
+            # Started from the nominal design at every weight rather than from
+            # the previous answer. Continuation is usually the right thing, but
+            # the designs here run to the corners of the box, and an SQP
+            # started at a corner where the previous weight left it reports
+            # optimality without moving: the balance it should be looking for
+            # is a long way off and nothing local points towards it.
+            p_start = p0.copy()
+            Ch0, _, Dh0, _ = parts(p_start)
+            x0 = np.r_[p_start, max(w1 * Ch0, w2 * Dh0)]
+
+            def f_ep(x):
+                return x[-1] + rho * float(np.sum(parts(x[:-1])[::2]))
+
+            def g_ep(x):
+                Ch, gC, Dh, gD = parts(x[:-1])
+                return np.r_[rho * (gC + gD), 1.0]
+
+            def c_ep(x):
+                Ch, _, Dh, _ = parts(x[:-1])
+                return np.array([x[-1] - w1 * Ch, x[-1] - w2 * Dh])
+
+            def cj_ep(x):
+                _, gC, _, gD = parts(x[:-1])
+                return np.vstack([np.r_[-w1 * gC, 1.0],
+                                  np.r_[-w2 * gD, 1.0]])
+
+            # ftol matched to what the inner solve can actually deliver. The
+            # design enters the constraints through a numerical optimal control
+            # problem, so the constraint values carry that solve's residual;
+            # asking the SQP to resolve past it makes it iterate against noise,
+            # which shows up as tens of iterations after the answer has stopped
+            # moving, and as convergence failures at the end of them.
+            r = minimize(f_ep, x0, jac=g_ep, method="SLSQP",
+                         bounds=list(zip(lo, hi)) + [(None, None)],
+                         constraints=[dict(type="ineq", fun=c_ep, jac=cj_ep)],
+                         options=dict(maxiter=max(max_outer, 100),
+                                      ftol=1e-7))
+            p_cur = np.clip(r.x[:-1], lo, hi)
+
+        if debug_vec:
+            Ch, _, Dh, _ = parts(p_cur)
+            print(f"{float(w):>6.2f}"
+                  f"{np.array2string(p_cur, precision=4, max_line_width=200):>34}"
+                  f"{Ch:>10.4f}{Dh:>10.4f}{w1 * Ch:>10.4f}{w2 * Dh:>10.4f}"
+                  f"{getattr(r, 'nit', -1):>5}{str(bool(r.success)):>6}")
+
+        # Final design solved properly, so the reported cost does not carry
+        # the working tolerance the search ran at:
+        sysp = _PinnedSystem(fam, nx, nu, N, z0, dt, p_cur)
+        U = np.asarray(lambda_shoot(sysp, zt, U0=_warm_for(p_cur),
+                                    ftol=1e-10, max_it=800)).flatten()
+        # The normalization travels with the front. Comparing against another
+        # method means solving the same scalarization, and that cannot be done
+        # without the ideal and nadir these weights are measured against.
+        front.append(dict(weight=float(w), param=p_cur.copy(),
+                          cost=float(U @ U),
+                          objective=float(objective(p_cur)), control=U,
+                          norm=dict(C_id=C_id, C_rng=C_rng,
+                                    D_id=D_id, D_rng=D_rng)))
+
+    # Same dominance filter the scalar path uses; a nonzero drop count means
+    # an inner solve went wrong rather than that a design is genuinely worse:
+    pareto = pareto_front(front)
+    n_dropped = len(front) - len(pareto)
+    if n_dropped:
+        print(f"[codesign] dropped {n_dropped} dominated point(s) of "
+              f"{len(front)}")
+
+    print(f"[codesign] {len(pareto)} front point(s) from {len(weights)} "
+          f"weights, {len(anchors)} anchors, "
+          f"{stats['solves']} inner solves")
+
+    pick = pareto[len(pareto) // 2]
+    if plot:
+        _plot_front(pareto, save, job)
+    return pick["control"], pick["param"], pareto, front
+
+
 def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
              p0, p_bounds, weights=None, substeps=1, save="figures",
              job="codesign", plot=True, target_idx=None, norm="cheby",
@@ -161,11 +410,27 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
              max_outer=40, jit=True, jit_flags="-O1",
              cache_dir=".grace_cache"):
 
+    # A vector p0 means several parameters are being sized together. The
+    # balance condition and the bracketed root find behind the scalar path both
+    # assume a single design number, so a vector design takes a gradient outer
+    # solve instead. The inner problem, the family, and the costate are the
+    # same in both cases.
+    p0_arr = np.atleast_1d(np.asarray(p0, float))
+    n_param = p0_arr.size
+    vector_design = n_param > 1
+
     # Build the parameter family once:
     fam = _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps,
                               jit=jit, target_idx=target_idx,
-                              jit_flags=jit_flags, cache_dir=cache_dir)
+                              jit_flags=jit_flags, cache_dir=cache_dir,
+                              n_param=n_param)
     tidx = fam["tidx"]
+
+    if vector_design:
+        return _codesign_vector(fam, tidx, nx, nu, N, z0, dt, target,
+                                objective, p0_arr, p_bounds, weights, norm,
+                                rho, p_tol, max_outer, save, job,
+                                plot, n_anchor)
 
     # Reduce the target to the constrained components:
     zt = np.asarray(target, float)
@@ -321,11 +586,6 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
         use_balance = norm not in ("l1", "l2")
         root_fn = balance_of_p if use_balance else g_of_p
 
-        # The balance function is monotone, so a bracket is guaranteed to work
-        # and is far more robust than extrapolating with a secant:
-        if use_balance:
-            p_pred = None
-
         # A gradient that never changes sign puts the optimum at a bound:
         p_scale = max(abs(p_bounds[1] - p_bounds[0]), 1e-9)
         xt = p_tol * p_scale
@@ -339,6 +599,11 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
             p_pred = hist_p[-1]
         else:
             p_pred = float(np.clip(p0, p_bounds[0], p_bounds[1]))
+
+        # The balance function is monotone, so a bracket is guaranteed to work
+        # and is far more robust than extrapolating with a secant:
+        if use_balance:
+            p_pred = None
 
         # Correct from the prediction with a secant iteration -- typically 3-4
         # evaluations, against ~12 for a bracket search over the full range:
@@ -389,9 +654,28 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
                 p_solved = float(p_bounds[0])
             elif gb < 0.0:
                 p_solved = float(p_bounds[1])
-            else:
+            elif ga <= 0.0 <= gb:
                 p_solved = float(brentq(root_fn, p_bounds[0], p_bounds[1],
                                         xtol=xt, rtol=1e-12))
+            else:
+
+                # Same sign at both bounds means the root function is not
+                # monotone -- scan for an interior sign change:
+                grid = np.linspace(p_bounds[0], p_bounds[1], max(n_anchor, 5))
+                vals = [ga] + [root_fn(x) for x in grid[1:-1]] + [gb]
+                for i in range(len(grid) - 1):
+                    if vals[i] == 0.0:
+                        p_solved = float(grid[i])
+                        break
+                    if vals[i] * vals[i + 1] < 0.0:
+                        p_solved = float(brentq(root_fn, grid[i], grid[i + 1],
+                                                xtol=xt, rtol=1e-12))
+                        break
+
+                # No crossing anywhere: one term attains the max throughout, so
+                # the optimum sits on whichever bound minimizes it:
+                if p_solved is None:
+                    p_solved = float(p_bounds[0] if ga > 0.0 else p_bounds[1])
 
         # Record for the next prediction:
         hist_w.append(float(w))
