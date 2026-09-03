@@ -50,6 +50,12 @@ SUBSTEPS = 24
 NG_COARSE = 56
 REFINE = 0
 MAX_IT = None
+
+# The inner loop runs to this step tolerance. V is stationary at the optimum,
+# so loosening it perturbs the value only to second order while cutting the
+# iteration count roughly in proportion to log(1/ftol). Set to None to use the
+# solver default of 1e-6, and use ra.ftol_check to measure what it costs:
+FTOL = 1e-3
 BUDGET_FRAC = [0.2, 0.4, 0.6, 0.8, 1.0]
 
 # === PLANTS ===
@@ -298,9 +304,9 @@ if __name__ == "__main__":
         V, xs, ys, ctrl, n1, f1 = ra.value_field(engine, system, U0, ext,
                                                  NG_COARSE, budgets[-1],
                                                  cost=cost, dims=(0, 1),
-                                                 max_it=MAX_IT)
+                                                 max_it=MAX_IT, ftol=FTOL)
         V, n2 = ra.repair(engine, system, U0, V, xs, ys, ctrl, cost=cost,
-                          dims=(0, 1))
+                          dims=(0, 1), ftol=FTOL)
 
         # Double the resolution only where a contour passes, which is far
         # cheaper than a uniform sweep at the same density:

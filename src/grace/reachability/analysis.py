@@ -554,53 +554,40 @@ from scipy import ndimage
 # the system with target_idx set to the plotted coordinates and every other
 # state is genuinely free rather than pinned at some arbitrary value:
 def value_at(engine, system, target, cost=None, warm=None, quiet=True,
-             max_it=None, probe_it=60, retry_tol=0.1):
+             max_it=None, ftol=None):
 
     import io
     import contextlib
 
-    # max_it=None leaves the solver's own iteration budget alone. Capping it
-    # is tempting, since the unreachable frontier queries spend the full
-    # budget proving they cannot converge, but a cap also truncates cells that
-    # would have converged and each of those becomes a hole in the surface:
+    # ftol is where the runtime is, and it can be loosened without costing
+    # accuracy. The inner loop runs until the step falls below ftol, on a
+    # fixed point map that barely contracts, and each iteration costs an
+    # endpoint Jacobian plus two rollouts. But the value is STATIONARY at the
+    # optimum: a control off by eps changes V by order eps squared, so a
+    # thousandfold looser step tolerance perturbs V in its sixth digit. The
+    # endpoint is not affected at all, since lambda_shoot finishes with a
+    # feasibility newton_shoot that puts it back on target regardless.
+    #
+    # Capping max_it is the unsafe knob by comparison: it truncates solves
+    # that were still converging, and each one becomes a hole in the surface.
+    # Unreachable targets do not need it -- their trust radius collapses to
+    # the floor in a dozen iterations and the unconstrained path breaks out.
     #
     # Most queries near the frontier sit outside the set, where the solver
     # correctly reports it could not satisfy the request. Expected here:
     sink = io.StringIO() if quiet else None
-    t = np.asarray(target, float)
-
-    def _shoot(it):
-        kw = dict(U0=warm, cost=cost)
-        if it is not None:
-            kw["max_it"] = it
-        if sink is None:
-            return engine.shooting.lambda_shoot(t, **kw)
+    kw = dict(U0=warm, cost=cost)
+    if max_it is not None:
+        kw["max_it"] = max_it
+    if ftol is not None:
+        kw["ftol"] = ftol
+    if sink is None:
+        U = engine.shooting.lambda_shoot(np.asarray(target, float), **kw)
+    else:
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            return engine.shooting.lambda_shoot(t, **kw)
+            U = engine.shooting.lambda_shoot(np.asarray(target, float), **kw)
 
-    # Two stages, because the cost of a query is wildly asymmetric. A target
-    # inside the set converges in a few iterations from a warm start; one
-    # outside cannot converge at all and spends the entire default budget
-    # proving it. The frontier is made of the latter, so they dominate the
-    # runtime even though they are a minority of the queries.
-    #
-    # So probe cheaply first, and only pay the full budget when the probe
-    # suggests it would have got there. A target well outside the set stalls
-    # far from it, while one merely short of convergence stalls close, and the
-    # endpoint the returned control actually achieves separates the two:
-    U = _shoot(probe_it if max_it is None else max_it)
     Uf = np.asarray(U, float).ravel()
-
-    if max_it is None and (not np.all(np.isfinite(Uf))
-                           or getattr(system, "_infeasible", False)):
-        e_probe = np.asarray(system.endpoint(Uf)).ravel() \
-            if np.all(np.isfinite(Uf)) else None
-        close = (e_probe is not None
-                 and np.linalg.norm(e_probe - t)
-                 <= retry_tol * max(1.0, float(np.linalg.norm(t))))
-        if close:
-            U = _shoot(None)
-            Uf = np.asarray(U, float).ravel()
 
     # lambda_shoot sets _infeasible when the endpoint was missed or a row is
     # still violated, which is the solver's own verdict and better than any
@@ -626,7 +613,8 @@ def value_at(engine, system, target, cost=None, warm=None, quiet=True,
 # warm start comes from an adjacent cell that already converged, which is the
 # single biggest factor in whether lambda_shoot converges at all.
 def value_field(engine, system, U0, ext, ng, budget_max, cost=None,
-                dims=(0, 1), quiet=True, max_solves=None, max_it=None):
+                dims=(0, 1), quiet=True, max_solves=None, max_it=None,
+                ftol=None):
 
     import heapq
 
@@ -679,7 +667,7 @@ def value_field(engine, system, U0, ext, ng, budget_max, cost=None,
     while heap:
         _, i, j, warm = heapq.heappop(heap)
         v, U = value_at(engine, system, np.array([xs[i], ys[j]]), cost, warm,
-                        quiet=quiet, max_it=max_it)
+                        quiet=quiet, max_it=max_it, ftol=ftol)
         n += 1
         if not np.isfinite(v):
             nfail += 1
@@ -794,7 +782,7 @@ def refine_field(engine, system, V, xs, ys, ctrl, budgets, cost=None,
 # not converge. Retry every gap from a converged neighbour before calling a
 # cell unreachable, which is what stops solver noise punching holes in the set:
 def repair(engine, system, U0, V, xs, ys, ctrl, cost=None, dims=(0, 1),
-           rounds=3, quiet=True):
+           rounds=3, quiet=True, ftol=None):
 
     e0 = np.asarray(system.endpoint(U0)).ravel()
     ng = len(xs)
@@ -821,7 +809,7 @@ def repair(engine, system, U0, V, xs, ys, ctrl, cost=None, dims=(0, 1),
                     warm = ctrl[(a, b)]
                     break
             v, U = value_at(engine, system, np.array([xs[i], ys[j]]), cost,
-                            warm, quiet=quiet)
+                            warm, quiet=quiet, ftol=ftol)
             n += 1
             if np.isfinite(v):
                 V[i, j] = v
@@ -903,3 +891,27 @@ def hybrid_zonotope(V, xs, ys, budgets):
                 budgets=sorted(float(x) for x in budgets),
                 n_cells=len(centers), n_continuous=2,
                 n_binary=int(np.ceil(np.log2(max(len(centers), 2)))))
+
+
+# Measure what a looser step tolerance costs in value. Solves a sample of
+# points twice, once at the loose tolerance and once at the solver default,
+# and reports the relative disagreement. V is stationary at the optimum so
+# this should be tiny; if it is not, the loosening is not safe on that plant:
+def ftol_check(engine, system, U0, ext, cost=None, ftol=1e-3, n=25, seed=0):
+
+    rng = np.random.default_rng(seed)
+    e0 = np.asarray(system.endpoint(U0)).ravel()
+    rel = []
+
+    for _ in range(n):
+        t = np.array([rng.uniform(ext[0], ext[1]), rng.uniform(ext[2], ext[3])])
+        v_loose, _ = value_at(engine, system, t, cost, warm=U0, ftol=ftol)
+        v_tight, _ = value_at(engine, system, t, cost, warm=U0)
+        if np.isfinite(v_loose) and np.isfinite(v_tight) and abs(v_tight) > 0:
+            rel.append(abs(v_loose - v_tight) / abs(v_tight))
+
+    if not rel:
+        return None
+
+    return dict(n=len(rel), median=float(np.median(rel)),
+                worst=float(np.max(rel)))
