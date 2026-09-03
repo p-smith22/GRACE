@@ -7,6 +7,49 @@ import casadi as ca
 from scipy.optimize import brentq, minimize
 from ..shooting.lambda_shoot import lambda_shoot
 
+# Value of the running cost at a control:
+def _cost_val(cost, U):
+
+    # No cost given means the quadratic minimum-effort default:
+    if cost is None:
+        return float(np.asarray(U) @ np.asarray(U))
+    return float(cost[0](U))
+
+# Cost gradient at a control, when the cost supplies one:
+def _cost_grad(cost, U):
+
+    # The quadratic default differentiates to twice the control:
+    if cost is None:
+        return 2.0 * np.asarray(U, float).flatten()
+
+    # A general cost only carries its gradient if the caller passed one:
+    if len(cost) > 3 and cost[3] is not None:
+        return np.asarray(cost[3](U), float).flatten()
+    return None
+
+# Endpoint multiplier at an inner optimum:
+def _costate_at(sysp, U, Co, cost):
+
+    # Stationarity of the inner problem is grad_U J = Co' lam, so when the cost
+    # gradient is available the multiplier is recovered by a least-squares solve
+    # at the returned control -- exactly what the quadratic path did with 2U,
+    # and correct for any cost:
+    g = _cost_grad(cost, U)
+    if g is not None:
+        m = Co.shape[0]
+        return safe_solve(Co @ Co.T + 1e-12 * np.eye(m), Co @ g)
+
+    # Without a gradient, fall back on the multiplier the inner solve produced.
+    # It uses the same convention, but it is the value at the last inner step
+    # rather than at the polished control:
+    lam = getattr(sysp, "_costate", None)
+    if lam is None:
+        raise ValueError(
+            "a general cost needs either its gradient, passed as the fourth "
+            "element of the cost tuple, or an inner solve that stored a "
+            "costate; neither was available")
+    return np.asarray(lam, float).flatten()
+
 # Build a parameterized system family and its parameter-sensitivity rollout:
 def _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps=1, jit=True,
                         target_idx=None, jit_flags="-O1", cache_dir=".grace_cache",
@@ -124,7 +167,7 @@ class _PinnedSystem:
 # Trace the front by solving directly at each design value:
 def scan(dynamics, nx, nu, N, z0, dt, target, param_name, objective, p_values,
          substeps=1, save="figures", job="scan", plot=True, target_idx=None,
-         filter_dominated=True):
+         filter_dominated=True, cost=None):
 
     # Build the parameter family once:
     fam = _build_param_family(dynamics, nx, nu, N, z0, dt, param_name, substeps,
@@ -140,8 +183,8 @@ def scan(dynamics, nx, nu, N, z0, dt, target, param_name, objective, p_values,
     U = None
     for pv in np.asarray(p_values, float):
         sp = _PinnedSystem(fam, nx, nu, N, z0, dt, float(pv))
-        U = lambda_shoot(sp, zt, U0=U)
-        front.append(dict(param=float(pv), cost=float(U @ U),
+        U = lambda_shoot(sp, zt, U0=U, cost=cost)
+        front.append(dict(param=float(pv), cost=_cost_val(cost, U),
                           objective=float(objective(float(pv))),
                           control=np.array(U, copy=True)))
 
@@ -160,17 +203,21 @@ def scan(dynamics, nx, nu, N, z0, dt, target, param_name, objective, p_values,
 # Run codesign over a named design parameter:
 def _codesign_vector(fam, tidx, nx, nu, N, z0, dt, target, objective,
                      p0, p_bounds, weights, norm, rho, p_tol, max_outer,
-                     save, job, plot, n_anchor, debug_vec=True):
+                     save, job, plot, n_anchor, debug_vec=True, cost=None,
+                     cost_dp=None):
 
     # Several design parameters at once. The inner solve is unchanged -- an
     # exact minimum-effort shoot at each candidate design -- and the design
     # gradient comes from the costate it already produces:
     #
-    #     dC*/dp = -lam' (de/dp)
+    #     dJ*/dp = -lam' (de/dp) + dJ/dp
     #
     # At the inner optimum the control is stationary, so a design perturbation
     # only moves the endpoint constraint and the control's own contribution
-    # drops out. Nothing is differentiated through the solve.
+    # drops out. The second term survives only when the running cost depends on
+    # the design explicitly, which is what cost_dp supplies; for a cost written
+    # in the control alone it is zero and this reduces to the contraction the
+    # quadratic path always used. Nothing is differentiated through the solve.
     lo = np.array([b[0] for b in p_bounds], float)
     hi = np.array([b[1] for b in p_bounds], float)
     zt = np.asarray(target, float)[tidx]
@@ -206,7 +253,8 @@ def _codesign_vector(fam, tidx, nx, nu, N, z0, dt, target, objective,
         # points the weights are normalized against, which needs two digits and
         # not seven, so it passes a loose tolerance and is much cheaper.
         U = np.asarray(lambda_shoot(sysp, zt, U0=_warm_for(pc),
-                                    ftol=ftol, max_it=max_it)).flatten()
+                                    ftol=ftol, max_it=max_it,
+                                    cost=cost)).flatten()
         stats["solves"] += 1
         warm["pts"].append((pc.copy(), U.copy()))
         return sysp, U
@@ -216,9 +264,17 @@ def _codesign_vector(fam, tidx, nx, nu, N, z0, dt, target, objective,
         sysp, U = inner(pc, **kw)
         _, Co = sysp.endpoint_jac(U)
         m = Co.shape[0]
-        lam = np.linalg.solve(Co @ Co.T + 1e-12 * np.eye(m), Co @ (2.0 * U))
+
+        # The multiplier is read from the cost's own stationarity, so the
+        # gradient below carries no assumption that the cost is quadratic:
+        lam = _costate_at(sysp, U, Co, cost)
         dgp = np.array(fam["F_dp"](U, pc)).reshape(m, -1)
-        return float(U @ U), -(dgp.T @ lam), U
+        gt = -(dgp.T @ lam)
+
+        # Explicit design dependence of the running cost, when there is one:
+        if cost_dp is not None:
+            gt = gt + np.asarray(cost_dp(U, pc), float).flatten()
+        return _cost_val(cost, U), gt, U
 
     # Anchor sweep, to place the ideal and nadir points the weights are
     # normalized against. The scalar path can sweep a dense grid because the
@@ -375,12 +431,13 @@ def _codesign_vector(fam, tidx, nx, nu, N, z0, dt, target, objective,
         # the working tolerance the search ran at:
         sysp = _PinnedSystem(fam, nx, nu, N, z0, dt, p_cur)
         U = np.asarray(lambda_shoot(sysp, zt, U0=_warm_for(p_cur),
-                                    ftol=1e-10, max_it=800)).flatten()
+                                    ftol=1e-10, max_it=800,
+                                    cost=cost)).flatten()
         # The normalization travels with the front. Comparing against another
         # method means solving the same scalarization, and that cannot be done
         # without the ideal and nadir these weights are measured against.
         front.append(dict(weight=float(w), param=p_cur.copy(),
-                          cost=float(U @ U),
+                          cost=_cost_val(cost, U),
                           objective=float(objective(p_cur)), control=U,
                           norm=dict(C_id=C_id, C_rng=C_rng,
                                     D_id=D_id, D_rng=D_rng)))
@@ -408,13 +465,16 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
              job="codesign", plot=True, target_idx=None, norm="cheby",
              n_anchor=9, beta=100.0, rho=1e-3, debug=False, p_tol=1e-5,
              max_outer=40, jit=True, jit_flags="-O1",
-             cache_dir=".grace_cache"):
+             cache_dir=".grace_cache", filter_dominated=True, cost=None,
+             cost_dp=None):
 
-    # A vector p0 means several parameters are being sized together. The
-    # balance condition and the bracketed root find behind the scalar path both
-    # assume a single design number, so a vector design takes a gradient outer
-    # solve instead. The inner problem, the family, and the costate are the
-    # same in both cases.
+    # cost is the same tuple lambda_shoot takes, (f, dinv[, dprime[, grad]]).
+    # Supplying the gradient is worth it here even without constraints: the
+    # design gradient recovers the multiplier by least squares at the returned
+    # control, and without a gradient it has to fall back on the costate stored
+    # at the last inner step instead. cost_dp(U, p) is the explicit design
+    # dependence of the running cost, and is only needed when the cost is
+    # written in terms of the design as well as the control.
     p0_arr = np.atleast_1d(np.asarray(p0, float))
     n_param = p0_arr.size
     vector_design = n_param > 1
@@ -426,11 +486,16 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
                               n_param=n_param)
     tidx = fam["tidx"]
 
+    # A vector p0 means several parameters are being sized together. The
+    # balance condition and the bracketed root find behind the scalar path both
+    # assume a single design number, so a vector design takes a gradient outer
+    # solve instead. The inner problem, the family, and the costate are the
+    # same in both cases.
     if vector_design:
         return _codesign_vector(fam, tidx, nx, nu, N, z0, dt, target,
                                 objective, p0_arr, p_bounds, weights, norm,
                                 rho, p_tol, max_outer, save, job,
-                                plot, n_anchor)
+                                plot, n_anchor, cost=cost, cost_dp=cost_dp)
 
     # Reduce the target to the constrained components:
     zt = np.asarray(target, float)
@@ -443,7 +508,7 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
 
     # Compute nominal control at the baseline design parameter:
     sys_nom = _PinnedSystem(fam, nx, nu, N, z0, dt, p0)
-    U_nominal = lambda_shoot(sys_nom, zt, U0=None)
+    U_nominal = lambda_shoot(sys_nom, zt, U0=None, cost=cost)
 
     # === ANCHOR SWEEP ===
     # Direct sweep over the scalar design parameter -- this is the exact front,
@@ -453,15 +518,15 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
     U_warm = U_nominal
     for pv in p_grid:
         sp = _PinnedSystem(fam, nx, nu, N, z0, dt, float(pv))
-        U_warm = lambda_shoot(sp, zt, U0=U_warm)
-        sweep.append(dict(param=float(pv), cost=float(U_warm @ U_warm),
+        U_warm = lambda_shoot(sp, zt, U0=U_warm, cost=cost)
+        sweep.append(dict(param=float(pv), cost=_cost_val(cost, U_warm),
                           objective=float(objective(float(pv))),
                           control=np.array(U_warm, copy=True)))
     C_grid = np.array([s["cost"] for s in sweep])
     D_grid = np.array([s["objective"] for s in sweep])
 
     # Verify stored controls match their recorded costs (catches seed aliasing):
-    C_check = np.array([float(s["control"] @ s["control"]) for s in sweep])
+    C_check = np.array([_cost_val(cost, s["control"]) for s in sweep])
     if not np.allclose(C_check, C_grid, rtol=1e-8):
         print("[codesign] WARNING: sweep controls do not match recorded costs")
         print(f"[codesign]   recorded: {np.array2string(C_grid, precision=1)}")
@@ -474,12 +539,14 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
               f"{'cold':>10} {'err_re':>9} {'err_cold':>9}")
         for s in sweep:
             sp = _PinnedSystem(fam, nx, nu, N, z0, dt, s["param"])
-            U_re = lambda_shoot(sp, zt, U0=np.array(s["control"], copy=True))
-            U_cold = lambda_shoot(sp, zt, U0=None)
+            U_re = lambda_shoot(sp, zt, U0=np.array(s["control"], copy=True),
+                                cost=cost)
+            U_cold = lambda_shoot(sp, zt, U0=None, cost=cost)
             e_re = float(np.linalg.norm(sp.endpoint(U_re) - zt))
             e_cold = float(np.linalg.norm(sp.endpoint(U_cold) - zt))
             print(f"[codesign] {s['param']:8.3f} {s['cost']:10.1f} "
-                  f"{float(U_re @ U_re):10.1f} {float(U_cold @ U_cold):10.1f} "
+                  f"{_cost_val(cost, U_re):10.1f} "
+                  f"{_cost_val(cost, U_cold):10.1f} "
                   f"{e_re:9.2e} {e_cold:9.2e}")
 
     # Ideal point, padded below the grid min so normalized objectives stay positive:
@@ -541,15 +608,32 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
             sp = _PinnedSystem(fam, nx, nu, N, z0, dt, float(pv))
             Uv = U_warm
             _, Cov = sp.endpoint_jac(Uv)
-            Wv = Cov @ Cov.T + 1e-6 * np.eye(sp.m)
-            lamv = safe_solve(Wv, -Cov @ (2 * Uv))
+
+            # Design sensitivity of the achieved control cost, from the
+            # costate the inner solve already produces:
+            #
+            #     dJ/dp = -lam' (de/dp) + dJ/dp|_explicit
+            #
+            # The multiplier is read off the cost's own stationarity condition,
+            # grad_U J = Co' lam, so nothing here assumes the cost is quadratic
+            # -- the quadratic case is just grad_U J = 2U.
+            #
+            # The minus belongs on the contraction, not on the multiplier.
+            # Folding it into lam and then not applying it here returns the
+            # gradient with the wrong sign, which a root find answers by
+            # walking to whichever bound is worst:
+            lamv = _costate_at(sp, Uv, Cov, cost)
             dgp = np.array(fam["F_dp"](Uv, float(pv))).flatten()
-            gt = float(lamv @ dgp)
+            gt = -float(lamv @ dgp)
+
+            # Explicit design dependence of the running cost, when there is one:
+            if cost_dp is not None:
+                gt = gt + float(np.asarray(cost_dp(Uv, float(pv))).flatten()[0])
             eps_o = 1e-6 * max(abs(p_bounds[1] - p_bounds[0]), 1e-6)
             go = (objective(pv + eps_o) - objective(pv - eps_o)) / (2 * eps_o)
 
             # Range-normalize both objectives from the ideal point:
-            Chat = (float(Uv @ Uv) - C_id) / C_rng
+            Chat = (_cost_val(cost, Uv) - C_id) / C_rng
             Dhat = (float(objective(pv)) - D_id) / D_rng
             return scalarize(Chat, Dhat, gt / C_rng, go / D_rng, w1, w2)
 
@@ -564,8 +648,8 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
             seed = U if U is not None else np.array(
                 sweep[int(np.argmin(np.abs(p_grid - float(pv))))]["control"],
                 copy=True)
-            U = lambda_shoot(sp, zt, U0=seed)
-            Chat = (float(U @ U) - C_id) / C_rng
+            U = lambda_shoot(sp, zt, U0=seed, cost=cost)
+            Chat = (_cost_val(cost, U) - C_id) / C_rng
             Dhat = (float(objective(pv)) - D_id) / D_rng
             # Oriented so it is positive when the design term dominates, which
             # matches the gradient's sign convention at the bounds: positive at
@@ -579,7 +663,7 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
             seed = U if U is not None else np.array(
                 sweep[int(np.argmin(np.abs(p_grid - float(pv))))]["control"],
                 copy=True)
-            U = lambda_shoot(sp, zt, U0=seed)
+            U = lambda_shoot(sp, zt, U0=seed, cost=cost)
             return design_grad(float(pv), U)
 
         # Chebyshev uses the balance condition; other norms need the gradient:
@@ -683,18 +767,33 @@ def codesign(dynamics, nx, nu, N, z0, dt, target, param_name, objective,
 
         # Final control at the located design:
         sysp = _PinnedSystem(fam, nx, nu, N, z0, dt, p_solved)
-        U = lambda_shoot(sysp, zt, U0=U)
+        U = lambda_shoot(sysp, zt, U0=U, cost=cost)
 
-        # Record the front point at the design the control was solved for:
-        front.append(dict(weight=float(w), param=p_solved, cost=float(U @ U),
-                          objective=float(objective(p_solved)), control=U))
+        # Record the front point at the design the control was solved for. The
+        # normalization travels with it: a caller who wants to state a trade in
+        # their own units, or to pose the same scalarization to another
+        # optimizer, cannot do either without the ideal and nadir the weights
+        # are measured against:
+        front.append(dict(weight=float(w), param=p_solved,
+                          cost=_cost_val(cost, U),
+                          objective=float(objective(p_solved)), control=U,
+                          norm=dict(C_id=C_id, C_rng=C_rng,
+                                    D_id=D_id, D_rng=D_rng)))
 
-
-    # Filter dominated points -- a nonzero drop count signals inner-solve trouble:
-    pareto = pareto_front(front)
-    n_dropped = len(front) - len(pareto)
-    if n_dropped:
-        print(f"[codesign] dropped {n_dropped} dominated point(s) of {len(front)}")
+    # Dominance filter. It exists to catch an inner solve that went wrong,
+    # since a bad solve shows up as a point another weight already beats on
+    # both objectives. It is optional because coincident answers are also
+    # legitimate: where both objectives improve in the same direction every
+    # weight returns the same design, and filtering then collapses a full
+    # weight sweep to a single point and discards the trade being traced:
+    if filter_dominated:
+        pareto = pareto_front(front)
+        n_dropped = len(front) - len(pareto)
+        if n_dropped:
+            print(f"[codesign] dropped {n_dropped} dominated point(s) of "
+                  f"{len(front)}")
+    else:
+        pareto = front
 
     # Select from the filtered front by the middle weight (balanced trade):
     pick = pareto[len(pareto) // 2]

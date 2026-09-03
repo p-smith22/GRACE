@@ -88,10 +88,18 @@ def main():
     ]
     constraints = obstacle_zones + surface_limits
 
+    import cProfile, pstats
+    cProfile.runctx("eng_obs.shooting.lambda_shoot(target_obs, "
+                    "constraints=obstacle_zones + surface_limits)",
+                    globals(), locals(), "/tmp/prof")
+    pstats.Stats("/tmp/prof").sort_stats("cumtime").print_stats(20)
+
     # Solve:
     start = time.time()
+    sys_obs._count_ls = True
     U_obs = eng_obs.shooting.lambda_shoot(
-        target_obs, constraints=obstacle_zones + surface_limits, outer=50, inner=20)
+        target_obs, constraints=obstacle_zones + surface_limits, outer=15, inner=20)
+    sys_obs._count_ls = False
     Z_obs = sys_obs.rollout(U_obs)
     print(f"OBSTACLE AVOIDANCE CASE ({time.time() - start:.2f}s): {eng_obs.utils.diagnostics(U_obs, target_obs, constraints)}")
 

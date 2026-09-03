@@ -1,14 +1,27 @@
 # ============================================================================
-# costate_comparison.py -- states and costates, GRACE vs IPOPT vs PMP
+# costate_comparison.py -- states, controls, and costates: GRACE vs IPOPT
 # ============================================================================
-# GRACE's Gramian solve produces a terminal costate directly:
-#     lam = (Co R^-1 Co^T)^-1 (Co R^-1 grad - delta)
-# This checks that costate against three independent references:
-#   1. IPOPT's Lagrange multiplier on the same terminal constraint (mu = -lam)
-#   2. the discrete adjoint recursion  lam_k = A_k^T lam_{k+1}
-#   3. Hamiltonian stationarity        R u_k = B_k^T lam_{k+1}
-# Agreement means the two methods find the same primal *and* dual solution,
-# which a runtime comparison cannot show.
+# The costate is constructed exactly as the derivation does. Stationarity is
+#
+#     grad l(u_k) + B_k^T lam_{k+1} = 0,     lam_k = A_k^T lam_{k+1}
+#
+# so every costate is a linear map of the terminal multiplier nu, and nu
+# follows from the Gramian and the displacement the control produces,
+#
+#     nu = -W^-1 delta,     W = Co M Co^T,     delta = Co U
+#
+# with M the inverse cost curvature, here R^-1 = I. For a quadratic cost this
+# is the same arithmetic as recovering nu by least squares from the converged
+# control, so it is reported as a cross check on the solver's own costate
+# rather than as an independent one.
+#
+# Sign convention throughout is the derivation's: grad l = -Co^T nu. Against
+# it, IPOPT's single shooting multiplier has the same sign, its transcription
+# defect multipliers have the opposite sign, and the solver's internal costate
+# is -nu.
+#
+# The reference objective is l = U^T U / 2, matching l = u^T R u / 2 with
+# R = I, so no factors of two appear anywhere.
 # ============================================================================
 
 import time
@@ -20,12 +33,14 @@ import matplotlib.pyplot as plt
 import grace
 
 # === PROBLEM ===
-# Planar quadrotor with thrust commanded as a deviation from hover:
+# Planar quadrotor, thrust commanded as a deviation from hover:
 G = 9.81
 J_INV = 1.0 / 0.02
 NX, NU, N, DT = 6, 2, 40, 0.05
 Z0 = np.zeros(NX)
 TARGET = np.array([3.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+SNAMES = ("x", "y", "th", "vx", "vy", "om")
+UNAMES = ("thrust dev", "torque")
 
 def dynamics(z, u):
     T = G + u[0]
@@ -35,7 +50,8 @@ def dynamics(z, u):
                       J_INV * u[1])
 
 # === REFERENCE PIECES ===
-# One RK4 step and its linearization, used for the adjoint recursion:
+# One RK4 step and its linearization. The linearization supplies A_k and B_k
+# for the adjoint recursion and for Hamiltonian stationarity:
 def _build():
     z = ca.MX.sym("z", NX)
     u = ca.MX.sym("u", NU)
@@ -47,7 +63,7 @@ def _build():
     step = ca.Function("step", [z, u], [zn])
     lin = ca.Function("lin", [z, u], [ca.jacobian(zn, z), ca.jacobian(zn, u)])
 
-    # Same rollout, for the IPOPT reference solve:
+    # Same rollout, for the single shooting reference:
     U = ca.MX.sym("U", N * NU)
     Zc = step.mapaccum("roll", N)(ca.DM(Z0), ca.reshape(U, NU, N))
     gend = Zc[:, -1] - ca.DM(TARGET)
@@ -55,9 +71,27 @@ def _build():
 
 LIN, U_SYM, G_END = _build()
 
-# Direct transcription of the same problem: states and controls are both
-# decision variables and the dynamics are per-node equality constraints, so
-# IPOPT returns one multiplier per node -- the interior costate itself.
+# Single shooting reference. The multiplier on the terminal constraint is nu
+# itself: stationarity of the NLP reads grad l + Co^T mu = 0, which is the
+# derivation's condition with mu in place of nu:
+def ipopt_shooting():
+    nlp = dict(x=U_SYM, f=0.5 * ca.dot(U_SYM, U_SYM), g=G_END)
+    t0 = time.perf_counter()
+    S = ca.nlpsol("ref", "ipopt", nlp,
+                  dict(ipopt=dict(print_level=0, sb="yes", tol=1e-12),
+                       print_time=0))
+    t_build = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    sol = S(x0=np.zeros(N * NU), lbg=np.zeros(NX), ubg=np.zeros(NX))
+    t_solve = time.perf_counter() - t0
+    return (np.array(sol["x"]).flatten(), np.array(sol["lam_g"]).flatten(),
+            S.stats()["success"], t_build, t_solve, S.stats()["iter_count"])
+
+# Direct transcription. States and controls are both decision variables and
+# the dynamics are per node equalities, so the defect multipliers are the
+# interior costates -- but with the opposite sign, since stationarity in u_k
+# there reads u_k - B_k^T eta_{k+1} = 0 against the derivation's
+# u_k + B_k^T lam_{k+1} = 0, hence eta = -lam:
 def ipopt_transcription():
     z = ca.MX.sym("zs", NX)
     u = ca.MX.sym("us", NU)
@@ -65,7 +99,8 @@ def ipopt_transcription():
     k2 = dynamics(z + 0.5 * DT * k1, u)
     k3 = dynamics(z + 0.5 * DT * k2, u)
     k4 = dynamics(z + DT * k3, u)
-    step = ca.Function("st", [z, u], [z + (DT / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)])
+    step = ca.Function("st", [z, u],
+                       [z + (DT / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)])
 
     Zv = [ca.MX.sym(f"z{k}", NX) for k in range(N + 1)]
     Uv = [ca.MX.sym(f"u{k}", NU) for k in range(N)]
@@ -78,7 +113,7 @@ def ipopt_transcription():
 
     X = ca.vertcat(*(Zv + Uv))
     Gc = ca.vertcat(*gc)
-    f = sum(ca.dot(Uv[k], Uv[k]) for k in range(N))
+    f = 0.5 * sum(ca.dot(Uv[k], Uv[k]) for k in range(N))
     t0 = time.perf_counter()
     S = ca.nlpsol("tr", "ipopt", dict(x=X, f=f, g=Gc),
                   dict(ipopt=dict(print_level=0, sb="yes", tol=1e-12),
@@ -92,27 +127,11 @@ def ipopt_transcription():
     mg = np.array(sol["lam_g"]).flatten()
 
     # Multiplier layout: initial block, N dynamics blocks, terminal block.
-    # The dynamics multipliers are the costates at nodes 1..N:
+    # Negated into the derivation's sign convention:
     Zt = xv[:(N + 1) * NX].reshape(N + 1, NX)
     Ut = xv[(N + 1) * NX:].reshape(N, NU)
-    nu_dyn = mg[NX:NX + N * NX].reshape(N, NX)
-    return (Zt, Ut, nu_dyn, S.stats()["success"], t_build, t_solve,
-            S.stats()["iter_count"])
-
-# Minimum-effort reference solve, multipliers taken from the NLP:
-def ipopt_reference():
-    nlp = dict(x=U_SYM, f=ca.dot(U_SYM, U_SYM), g=G_END)
-    t0 = time.perf_counter()
-    S = ca.nlpsol("ref", "ipopt", nlp,
-                  dict(ipopt=dict(print_level=0, sb="yes", tol=1e-12),
-                       print_time=0))
-    t_build = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    sol = S(x0=np.zeros(N * NU), lbg=np.zeros(NX), ubg=np.zeros(NX))
-    t_solve = time.perf_counter() - t0
-    return (np.array(sol["x"]).flatten(),
-            np.array(sol["lam_g"]).flatten(),
-            S.stats()["success"], t_build, t_solve,
+    lam_int = -mg[NX:NX + N * NX].reshape(N, NX)
+    return (Zt, Ut, lam_int, S.stats()["success"], t_build, t_solve,
             S.stats()["iter_count"])
 
 # === RUN ===
@@ -132,136 +151,148 @@ if __name__ == "__main__":
     Z = np.asarray(system.rollout(U))
     g, Co = system.endpoint_jac(U)
 
-    # GRACE terminal costate from the Gramian solve (R = I here):
-    t0 = time.perf_counter()
-    W = Co @ Co.T
-    lam_T = np.linalg.solve(W + 1e-14 * np.eye(NX), Co @ (2.0 * U))
-    t_costate_gr = time.perf_counter() - t0
+    # === TERMINAL MULTIPLIER ===
+    # Constructed as the derivation constructs it: the generalized Gramian
+    # W = Co M Co^T against the displacement the control produces. With a
+    # quadratic cost M = R^-1 = I, so W is the standard output Gramian:
+    M_diag = np.ones(N * NU)
+    W = (Co * M_diag) @ Co.T
+    delta = Co @ U
+    nu_gram = -np.linalg.solve(W + 1e-14 * np.eye(NX), delta)
 
-    # IPOPT references: single shooting for the terminal dual, transcription
-    # for the interior costate sequence:
-    U_ip, mu_ip, ok, t_b_ss, t_s_ss, it_ss = ipopt_reference()
-    Z_tr, U_tr, nu_tr, ok_tr, t_b_tr, t_s_tr, it_tr = ipopt_transcription()
+    # The solver's own costate is the object the derivation claims as a
+    # byproduct, so it is what the comparisons use. It carries the opposite
+    # sign to nu, so it is converted here:
+    lam_solver = getattr(system, "_costate", None)
+    if lam_solver is None:
+        print("NOTE: solver returned no costate, using the constructed one")
+        nu = nu_gram
+        d_gram = np.nan
+    else:
+        nu = -0.5 * np.asarray(lam_solver, float).ravel()
+        d_gram = (np.linalg.norm(nu - nu_gram)
+                  / max(np.linalg.norm(nu), 1e-15))
 
-    # === CHECK 1: costate vs NLP multiplier (expect mu = -lam) ===
-    d_dual = np.linalg.norm(lam_T + mu_ip) / max(np.linalg.norm(lam_T), 1e-15)
-    d_prim = np.linalg.norm(U - U_ip) / max(np.linalg.norm(U_ip), 1e-15)
+    # References:
+    U_ss, mu_ss, ok_ss, t_b_ss, t_s_ss, it_ss = ipopt_shooting()
+    Z_tr, U_tr, lam_tr, ok_tr, t_b_tr, t_s_tr, it_tr = ipopt_transcription()
+
+    # === CHECK 1: terminal multiplier against the shooting multiplier ===
+    d_dual = np.linalg.norm(nu - mu_ss) / max(np.linalg.norm(nu), 1e-15)
+    d_prim = np.linalg.norm(U - U_ss) / max(np.linalg.norm(U_ss), 1e-15)
 
     # === CHECK 2 and 3: adjoint recursion and Hamiltonian stationarity ===
+    # Terminal condition lam_N = C^T nu, and C is the identity here since the
+    # full state is constrained. The recursion and the control law are the
+    # derivation's, with grad l = u for this cost:
     lam = np.zeros((N + 1, NX))
-    lam[N] = lam_T
+    lam[N] = nu
     pmp = np.zeros(N)
+    U_pmp = np.zeros((N, NU))
     for k in range(N - 1, -1, -1):
         A, B = LIN(Z[k], U[k * NU:(k + 1) * NU])
         A = np.array(A)
         B = np.array(B)
         lam[k] = A.T @ lam[k + 1]
-        pmp[k] = np.linalg.norm(2.0 * U[k * NU:(k + 1) * NU]
-                                - B.T @ lam[k + 1])
-    u_scale = max(np.abs(2.0 * U).max(), 1e-15)
-
-    # === REPORT ===
-    print(f"IPOPT converged      : {ok}")
-    print(f"endpoint error       : {np.linalg.norm(g - system.target(TARGET)):.3e}")
-    print(f"control effort       : GRACE {U @ U:.6f}   IPOPT {U_ip @ U_ip:.6f}")
-    print(f"\nprimal agreement     : ||U - U_ipopt|| / ||U_ipopt|| = {d_prim:.3e}")
-    print(f"dual   agreement     : ||lam + mu_ipopt|| / ||lam||   = {d_dual:.3e}")
-    print(f"\nGRACE terminal costate: {np.array2string(lam_T, precision=4)}")
-    print(f"IPOPT multiplier      : {np.array2string(mu_ip, precision=4)}")
-    print(f"\nstationarity 2U - Co^T lam : "
-          f"{np.linalg.norm(2 * U - Co.T @ lam_T) / np.linalg.norm(2 * U):.3e}")
-    print(f"PMP residual  max {pmp.max():.3e}   "
-          f"relative {pmp.max() / u_scale:.3e}")
+        U_pmp[k] = -B.T @ lam[k + 1]
+        pmp[k] = np.linalg.norm(U[k * NU:(k + 1) * NU] + B.T @ lam[k + 1])
+    u_scale = max(np.abs(U).max(), 1e-15)
 
     # === CHECK 4: interior costates against the transcription multipliers ===
-    # The dynamics multipliers are the costates at nodes 1..N, same sign:
     lam_scale = max(np.abs(lam[1:]).max(), 1e-15)
-    d_int = np.abs(lam[1:] - nu_tr).max() / lam_scale
+    d_int = np.abs(lam[1:] - lam_tr).max() / lam_scale
     d_state = np.abs(Z - Z_tr).max() / max(np.abs(Z_tr).max(), 1e-15)
-    print(f"\ntranscription converged : {ok_tr}")
-    print(f"cost (transcription)    : {float((U_tr ** 2).sum()):.6f}")
-    print(f"state agreement         : max rel diff {d_state:.3e}")
-    print(f"interior costate agree  : max rel diff {d_int:.3e}")
+    d_ctrl = (np.abs(U.reshape(N, NU) - U_tr).max()
+              / max(np.abs(U_tr).max(), 1e-15))
 
-    # === PLOTS ===
-    t = np.arange(N + 1) * DT
-    fig, ax = plt.subplots(1, 3, figsize=(16.5, 4.6))
+    # === REPORT ===
+    print(f"IPOPT converged, shooting / transcription : {ok_ss} / {ok_tr}")
+    print(f"endpoint error : "
+          f"{np.linalg.norm(g - system.target(TARGET)):.3e}")
+    print(f"effort U^T U/2 : GRACE {0.5 * U @ U:.8f}   "
+          f"shooting {0.5 * U_ss @ U_ss:.8f}   "
+          f"transcription {0.5 * float((U_tr ** 2).sum()):.8f}")
 
-    # Every costate the three methods produce, on one axis.
-    #
-    #   lines   GRACE: the terminal costate comes straight out of the Gramian
-    #           solve, and the interior from the adjoint recursion run back
-    #           through the linearizations
-    #   dots    IPOPT transcription: the multipliers on the per node dynamics
-    #           defects are the interior costates, same sign, no recursion
-    #   crosses IPOPT single shooting: only the terminal one is available, as
-    #           the multiplier on the endpoint constraint, with mu = -lam
-    names = ["x", "y", "th", "vx", "vy", "om"]
-    for j in range(NX):
-        ax[0].plot(t, lam[:, j], "-", lw=1.6, color=f"C{j}",
-                   label=f"$\\lambda_{{{names[j]}}}$")
-        ax[0].plot(t[1:], nu_tr[:, j], "o", ms=3.5, color=f"C{j}", alpha=0.55)
-        ax[0].plot(t[-1], -mu_ip[j], "x", ms=9, mew=2.0, color=f"C{j}")
-    ax[0].set_xlabel("time [s]")
-    ax[0].set_ylabel("costate")
-    ax[0].set_title("GRACE (lines), transcription duals (dots),\n"
-                    f"single shooting terminal (x) -- max rel diff {d_int:.1e}")
-    ax[0].legend(fontsize=8, ncol=2)
-    ax[0].grid(alpha=0.3)
+    print(f"\nprimal agreement, shooting      : {d_prim:.3e}")
+    print(f"primal agreement, transcription : states {d_state:.3e}, "
+          f"controls {d_ctrl:.3e}")
+    print(f"dual agreement, terminal        : {d_dual:.3e}")
+    print(f"dual agreement, interior        : {d_int:.3e}")
+    print(f"solver nu vs Gramian formula    : {d_gram:.3e}")
 
-    # Control against its PMP prediction from the costate:
-    Un = U.reshape(N, NU)
-    ax[1].plot(t[:-1], Un[:, 0], "-", color="steelblue", lw=1.8,
-               label="thrust dev (solved)")
-    ax[1].plot(t[:-1], Un[:, 1], "-", color="darkorange", lw=1.8,
-               label="torque (solved)")
-    Upmp = np.zeros((N, NU))
-    for k in range(N):
-        _, B = LIN(Z[k], U[k * NU:(k + 1) * NU])
-        Upmp[k] = 0.5 * np.array(B).T @ lam[k + 1]
-    ax[1].plot(t[:-1], Upmp[:, 0], "--", color="k", lw=1.0,
-               label="$B^T\\lambda/2$ (PMP)")
-    ax[1].plot(t[:-1], Upmp[:, 1], "--", color="k", lw=1.0)
-    ax[1].set_xlabel("time [s]")
-    ax[1].set_ylabel("control")
-    ax[1].set_title("Control vs PMP prediction")
-    ax[1].legend(fontsize=8)
-    ax[1].grid(alpha=0.3)
+    print(f"\nnu, GRACE              : {np.array2string(nu, precision=4)}")
+    print(f"nu, Gramian formula    : {np.array2string(nu_gram, precision=4)}")
+    print(f"mu, IPOPT shooting     : {np.array2string(mu_ss, precision=4)}")
+    print(f"lam_N, transcription   : "
+          f"{np.array2string(lam_tr[-1], precision=4)}")
 
-    # Costate agreement at the terminal node:
-    idx = np.arange(NX)
-    ax[2].bar(idx - 0.2, lam_T, width=0.4, color="steelblue",
-              label="GRACE $\\lambda_N$")
-    ax[2].bar(idx + 0.2, -mu_ip, width=0.4, color="0.5",
-              label="IPOPT $-\\mu$")
-    ax[2].set_xticks(idx)
-    ax[2].set_xticklabels(names)
-    ax[2].set_ylabel("multiplier")
-    ax[2].set_title(f"Terminal costate (rel. diff {d_dual:.1e})")
-    ax[2].legend(fontsize=9)
-    ax[2].grid(alpha=0.3, axis="y")
+    print(f"\nstationarity U + Co^T nu : "
+          f"{np.linalg.norm(U + Co.T @ nu) / np.linalg.norm(U):.3e}")
+    print(f"PMP residual, max {pmp.max():.3e}, relative "
+          f"{pmp.max() / u_scale:.3e}")
 
-    fig.tight_layout()
-    fig.savefig("figures/tests/costate_comparison.png", dpi=140, bbox_inches="tight")
     # === TIMING ===
-    # Costate construction is one nx x nx solve on top of the shoot, so it is
-    # reported separately from the trajectory solve:
     print("\n=== timing ===")
-    print(f"{'method':<26}{'build s':>10}{'solve s':>10}"
-          f"{'iters':>8}{'vars':>7}")
+    print(f"{'method':<26}{'build s':>10}{'solve s':>10}{'iters':>8}{'vars':>7}")
     print(f"{'GRACE shoot':<26}{t_build_gr:>10.4f}{t_solve_gr:>10.4f}"
           f"{'-':>8}{N * NU:>7}")
-    print(f"{'  + costate':<26}{'':>10}{t_costate_gr:>10.4f}{'':>8}{'':>7}")
     print(f"{'IPOPT single shooting':<26}{t_b_ss:>10.4f}{t_s_ss:>10.4f}"
           f"{it_ss:>8}{N * NU:>7}")
     print(f"{'IPOPT transcription':<26}{t_b_tr:>10.4f}{t_s_tr:>10.4f}"
           f"{it_tr:>8}{(N + 1) * NX + N * NU:>7}")
-    tg = t_solve_gr + t_costate_gr
-    print(f"\nsolve speedup vs single shooting : "
-          f"{t_s_ss / max(tg, 1e-12):.2f}x")
-    print(f"solve speedup vs transcription   : "
-          f"{t_s_tr / max(tg, 1e-12):.2f}x")
-    print(f"total speedup vs single shooting : "
-          f"{(t_b_ss + t_s_ss) / max(t_build_gr + tg, 1e-12):.2f}x")
+    print(f"\nsolve speedup vs shooting      : "
+          f"{t_s_ss / max(t_solve_gr, 1e-12):.2f}x")
+    print(f"solve speedup vs transcription : "
+          f"{t_s_tr / max(t_solve_gr, 1e-12):.2f}x")
 
+    # === PLOT ===
+    # One figure. States and controls show the primals land on top of each
+    # other, costates show the duals do as well, which is the stronger claim:
+    t = np.arange(N + 1) * DT
+    tu = t[:-1]
+    fig, ax = plt.subplots(1, 3, figsize=(16.5, 4.8))
+
+    for j in range(NX):
+        ax[0].plot(t, Z[:, j], "-", lw=1.7, color=f"C{j}", label=SNAMES[j])
+        ax[0].plot(t[::3], Z_tr[::3, j], "o", ms=3.5, mfc="none",
+                   color=f"C{j}")
+        ax[0].plot(t[-1], TARGET[j], "*", color="k", ms=12)
+    ax[0].set_xlabel("Time [s]")
+    ax[0].set_ylabel("State")
+    ax[0].set_title(f"States, GRACE (lines), IPOPT (circles)")
+    ax[0].legend(fontsize=8, ncol=2)
+    ax[0].grid(alpha=0.3)
+
+    Un = U.reshape(N, NU)
+    for j in range(NU):
+        ax[1].plot(tu, Un[:, j], "-", lw=1.8, color=f"C{j}",
+                   label=f"{UNAMES[j]}, GRACE")
+        ax[1].plot(tu[::3], U_tr[::3, j], "o", ms=3.5, mfc="none",
+                   color=f"C{j}", label=f"{UNAMES[j]}, IPOPT")
+        ax[1].plot(tu, U_pmp[:, j], "--", lw=1.0, color="k")
+    ax[1].set_xlabel("Time [s]")
+    ax[1].set_ylabel("Control")
+    ax[1].set_title(f"Controls")
+    ax[1].legend(fontsize=8)
+    ax[1].grid(alpha=0.3)
+
+    # Lines are GRACE, terminal from the solve and interior from the adjoint
+    # recursion. Circles are the transcription defect multipliers, negated
+    # into this convention. Crosses are the single shooting terminal dual,
+    # the only one that method makes available, same sign as nu:
+    for j in range(NX):
+        ax[2].plot(t, lam[:, j], "-", lw=1.7, color=f"C{j}",
+                   label=rf"$\lambda_{{{SNAMES[j]}}}$")
+        ax[2].plot(t[1:][::3], lam_tr[::3, j], "o", ms=3.5, mfc="none",
+                   color=f"C{j}")
+        ax[2].plot(t[-1], mu_ss[j], "x", ms=9, mew=2.0, color=f"C{j}")
+    ax[2].set_xlabel("Time [s]")
+    ax[2].set_ylabel("Costate")
+    ax[2].set_title(f"Costates, GRACE (lines), IPOPT (circles)")
+    ax[2].legend(fontsize=8, ncol=2)
+    ax[2].grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig("figures/tests/costate_comparison.png", dpi=140,
+                bbox_inches="tight")
     print("\nsaved figures/tests/costate_comparison.png")

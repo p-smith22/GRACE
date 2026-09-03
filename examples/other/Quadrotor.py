@@ -53,9 +53,9 @@ def main():
 
     # === LQR TRACKING DEMO ===
     # Define weights:
-    Q = np.diag([200, 200, 20, 20, 5, 5])
+    Q = np.diag([200, 200, 20, 20, 5, 5]) * 10
     R = 0.01 * np.eye(2)
-    Qf = 1000000 * Q
+    Qf = 10000 * Q
 
     # Fetch gains:
     gains, Z_nom = engine.tracking.lqr_gains(U, Q, R, Qf)

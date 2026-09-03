@@ -1,5 +1,6 @@
 # Import packages:
 import os
+import glob
 import hashlib
 import shutil
 import subprocess
@@ -15,9 +16,12 @@ def _graph_key(system):
     if isinstance(graph, str):
         graph = graph.encode()
 
-    # Dimensions and index sets change the compiled code, so they are keyed too:
+    # Dimensions and index sets change the compiled code, so they are keyed
+    # too. The marker is bumped whenever the set of emitted objects changes,
+    # since one compiled before the change is missing what the loader asks for:
     shape = repr((system.nx, system.nu, system.N, float(system.dt),
-                  tuple(system.tidx), int(getattr(system, "substeps", 1))))
+                  tuple(system.tidx), int(getattr(system, "substeps", 1)),
+                  "stateJ-block"))
     return hashlib.sha256(graph + b"|" + shape.encode()).hexdigest()[:16]
 
 
@@ -31,24 +35,28 @@ def _job_dir(job, data_dir):
 # Return the paths of the shared object and metadata for a job:
 def _paths(job, data_dir):
 
-    # One shared object holds every compiled function for the job:
+    # The core object holds the rollout and the one-step Jacobians; each state
+    # Jacobian sits in its own object beside it:
     d = _job_dir(job, data_dir)
     return d, os.path.join(d, "graph.so"), os.path.join(d, "meta.npz")
+
+
 
 # Check whether a compiled shared object exists for a job and matches the key:
 def has_cache(job, data_dir=DATA_DIR, key=None):
 
     # Both the shared object and its metadata have to be present:
-    _, so_path, meta_path = _paths(job, data_dir)
+    d, so_path, meta_path = _paths(job, data_dir)
     if not (os.path.exists(so_path) and os.path.exists(meta_path)):
         return False
 
     # A cache whose key does not match the current graph is stale, not usable:
     try:
         meta = np.load(meta_path, allow_pickle=True)
-        if key is None:
-            return True
-        return str(meta["key"]) == key
+        if key is not None and str(meta["key"]) != key:
+            return False
+
+        return True
     except Exception:
         return False
 
@@ -81,18 +89,25 @@ def _graph_functions(step, F_roll, F_end, nx, nu, N):
     U_tape = ca.MX.sym("U_tape", nu, N)
     A_map = ca.Function("A_map", [Z_tape, U_tape], [A.map(N)(Z_tape, U_tape)])
     B_map = ca.Function("B_map", [Z_tape, U_tape], [B.map(N)(Z_tape, U_tape)])
-    # The state-trajectory Jacobian is emitted too.  A reloaded F_roll is a
+
+    # The state-trajectory Jacobian is emitted too. A reloaded F_roll is a
     # compiled external and cannot be differentiated, so anything needing dZ/dU
-    # has to find it already built:
+    # has to find it already built.
+    #
+    # It stays one function covering every state. Emitting a function per state
+    # looks like it would divide the work, but the trajectory Jacobian is one
+    # shared graph -- each node's derivative feeds the next -- so every split
+    # function has to re-emit nearly all of it. The build then grows with nx
+    # instead of staying fixed, and no amount of parallel compiling recovers
+    # work that should not have been duplicated. The caller slices what it
+    # needs at evaluation time instead:
     U = ca.MX.sym("U", N * nu)
     Z0 = ca.MX.sym("Z0", nx)
     Zs = F_roll(U, Z0)
     flat = ca.reshape(Zs.T, (N + 1) * nx, 1)
     F_stateJ = ca.Function("F_stateJ", [U, Z0], [ca.jacobian(flat, U)])
-    funcs = [ca.Function("step", [z, u], [z_next]), F_roll, F_end,
-             A, B, A_map, B_map, F_stateJ]
-
-    return funcs
+    return [ca.Function("step", [z, u], [z_next]), F_roll, F_end,
+            A, B, A_map, B_map, F_stateJ]
 
 
 # Emit the graph as C and compile it to a shared object:
@@ -108,9 +123,12 @@ def compile_graph(system, key, data_dir=DATA_DIR, opt="-O2", verbose=False):
     if cc is None:
         return None
 
-    # Ensure the job directory exists:
+    # Ensure the job directory exists, and clear any objects left by a build
+    # that emitted a different set of functions:
     d, so_path, meta_path = _paths(system.job, data_dir)
     os.makedirs(d, exist_ok=True)
+    for stale in glob.glob(os.path.join(d, "stateJ_*.so")):
+        os.remove(stale)
 
     # Emit every function the reloaded system needs into a single C file:
     funcs = _graph_functions(system.step, system.F_roll, system.F_end,
@@ -185,9 +203,11 @@ def load(job, data_dir=DATA_DIR):
         Bs = [Bb[:, k * nu:(k + 1) * nu] for k in range(N)]
         return As, Bs
 
-    # Row Jacobians come from the emitted state Jacobian, sliced to the
-    # requested indices and cached on the control tape:
+    # The state Jacobian, and which of its flat rows each index set needs.
+    # flat is the trajectory stacked state-major, so state i at node k is row
+    # k*nx + i:
     F_stateJ = ca.external("F_stateJ", so_path)
+    _row_sel = {}
 
     def row_jac(U, idx):
         key = tuple(idx)
@@ -197,8 +217,17 @@ def load(job, data_dir=DATA_DIR):
         if (hit is not None and hit[0].shape == Uf.shape
                 and np.array_equal(hit[0], Uf) and np.array_equal(hit[2], z0)):
             return hit[1]
-        full = np.array(F_stateJ(Uf, z0)).reshape(N + 1, nx, N * nu)
-        J = full[:, list(key), :]
+
+        # Slice before converting. The emitted Jacobian covers every state at
+        # every node, but a constraint reads only a few of them, and converting
+        # a CasADi matrix to numpy costs a Python round trip per element.
+        # Taking the rows in CasADi first leaves nx/len(idx) times less to
+        # convert, and the result is the same array either way:
+        sel = _row_sel.get(key)
+        if sel is None:
+            sel = _row_sel[key] = [k * nx + i
+                                   for k in range(N + 1) for i in key]
+        J = np.array(F_stateJ(Uf, z0)[sel, :]).reshape(N + 1, len(key), N * nu)
         reloaded._row_cache[key] = (Uf.copy(), J, z0.copy())
         return J
 
@@ -212,7 +241,8 @@ def load(job, data_dir=DATA_DIR):
 
 # Build a System, compiling it once and reloading the compiled object after:
 def build_cached(dynamics, nx, nu, N, z0, dt, job, target_idx=None,
-                 substeps=1, jit=False, data_dir=DATA_DIR, rebuild=False, verbose=False):
+                 substeps=1, jit=False, data_dir=DATA_DIR, rebuild=False,
+                 verbose=False):
 
     # Build symbolic graph:
     system = build(dynamics, nx, nu, N, z0, dt, target_idx=target_idx,

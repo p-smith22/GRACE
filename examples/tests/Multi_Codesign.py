@@ -1,24 +1,4 @@
-# ============================================================================
-# multi_codesign.py -- three design parameters at once, through codesign()
-# ============================================================================
-# codesign() takes a vector design as readily as a scalar one. With more than
-# one parameter the balance condition behind the Chebyshev path no longer
-# applies -- it locates a crossing between two numbers, and there is no single
-# crossing to find -- so the outer solve becomes a gradient method. The
-# gradient is not a finite difference and is not obtained by differentiating
-# through the inner solve: at the inner optimum the control is stationary, so a
-# design perturbation only shifts the endpoint constraint and
-#
-#     dC*/dp = -lam' (de/dp)
-#
-# with lam the costate the inner solve already produced. That is the whole cost
-# of making the outer problem differentiable.
-#
-# Vehicle: a planar quadrotor sized on arm length, motor thrust capability and
-# propeller diameter, checked against a monolithic NLP that optimizes the
-# controls and all three parameters at once.
-# ============================================================================
-
+# Import packages:
 import time
 import numpy as np
 import casadi as ca
@@ -238,14 +218,14 @@ if __name__ == "__main__":
     n_w = len(WSET)
     print(f"\n{'':<24}{'build s':>10}{'solve s':>10}{'total s':>10}"
           f"{'ms per point':>14}")
-    print(f"{'codesign (bilevel)':<24}{'cached':>10}{t_cd:>10.3f}"
+    print(f"{'codesign (GRACE)':<24}{'cached':>10}{t_cd:>10.3f}"
           f"{t_cd:>10.3f}{t_cd / n_w * 1e3:>14.1f}")
     print(f"{'joint NLP (IPOPT)':<24}{t_build_jt:>10.3f}{t_jt:>10.3f}"
           f"{t_build_jt + t_jt:>10.3f}{t_jt / n_w * 1e3:>14.1f}")
-    print(f"{'solve ratio':<24}{'':>10}"
-          f"{t_cd / max(t_jt, 1e-12):>10.2f}x")
-    print(f"{'total ratio':<24}{'':>10}{'':>10}"
-          f"{t_cd / max(t_build_jt + t_jt, 1e-12):>10.2f}x")
+    print(f"{'solve speedup':<24}{'':>10}"
+          f"{1 / (t_cd / max(t_jt, 1e-12)):>10.2f}x")
+    print(f"{'total speedup':<24}{'':>10}{'':>10}"
+          f"{1 / (t_cd / max(t_build_jt + t_jt, 1e-12)):>10.2f}x")
     # Agreement measured as the effort each front reports at the same mass,
     # over the range both cover. Nearest neighbour in the plane is misleading
     # here: the two fronts run to different extremes, and a point past the end
@@ -321,18 +301,18 @@ if __name__ == "__main__":
         a.tick_params(labelsize=7)
         a.grid(alpha=0.3, axis="y")
         if j == 0:
-            a.set_ylabel("value, dotted lines are the bounds", fontsize=7)
+            a.set_ylabel("Parameter Value", fontsize=7)
 
     labs = ["nominal", "codesign", "joint NLP"]
     cols3 = ["0.6", "steelblue", "darkorange"]
     ax[1].bar(labs, [C_ref, C_cd, C_jt], color=cols3)
     ax[1].set_ylabel("control effort")
-    ax[1].set_title("Effort at the selected design")
+    ax[1].set_title("Control effort")
     ax[1].grid(alpha=0.3, axis="y")
 
     ax[2].bar(labs, [D_ref, D_cd, D_jt], color=cols3)
     ax[2].set_ylabel("take-off mass [kg]")
-    ax[2].set_title("Mass at the selected design")
+    ax[2].set_title("Design Cost (Mass)")
     ax[2].grid(alpha=0.3, axis="y")
 
     for lab, _, _, col in trajs:
@@ -342,7 +322,7 @@ if __name__ == "__main__":
                label="target")
     ax[3].set_xlabel("x [m]")
     ax[3].set_ylabel("y [m]")
-    ax[3].set_title("Path flown")
+    ax[3].set_title("Trajectory")
     ax[3].legend(fontsize=8)
     ax[3].grid(alpha=0.3)
 
@@ -363,7 +343,7 @@ if __name__ == "__main__":
     ax[5].set_xlabel("take-off mass [kg]")
     ax[5].set_ylabel("control effort")
     ax[5].set_yscale("log")
-    ax[5].set_title("The same front, traced two ways")
+    ax[5].set_title("Pareto Front")
     ax[5].legend(fontsize=8)
     ax[5].grid(alpha=0.3)
 

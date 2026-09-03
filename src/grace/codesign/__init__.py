@@ -20,7 +20,7 @@ class Codesign:
                  job="codesign", plot=True, target_idx=None, norm="cheby",
                  n_anchor=9, beta=100.0, rho=1e-3, debug=False,
                  p_tol=1e-5, max_outer=40, jit=True, jit_flags="-O1",
-                 cache_dir=".grace_cache"):
+                 cache_dir=".grace_cache", filter_dominated=True):
         return _codesign(self.dynamics, self.nx, self.nu, self.N, self.z0,
                          self.dt, target, param_name, objective, p0, p_bounds,
                          weights=weights, substeps=substeps,
@@ -29,7 +29,8 @@ class Codesign:
                          n_anchor=n_anchor, beta=beta, rho=rho, debug=debug,
                          p_tol=p_tol, max_outer=max_outer,
                          jit=jit, jit_flags=jit_flags,
-                         cache_dir=cache_dir)
+                         cache_dir=cache_dir,
+                         filter_dominated=filter_dominated)
 
     # Trace the front by solving directly at each design value:
     def scan(self, target, param_name, objective, p_values, substeps=1,

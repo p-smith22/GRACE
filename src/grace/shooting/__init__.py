@@ -17,11 +17,11 @@ class Shooting:
         # package therefore sees only reduced targets, which keeps the
         # convention in one place instead of split across call sites:
         zt = self.system.target(target)
-        return _newton_shoot(self.system, zt, U0=U0, it=it, u_lo=u_lo, u_hi=u_hi)
+        return _newton_shoot(self.system, zt, U0=U0, it=it)
 
-    # Lambda shoot for optimal control:
-    def lambda_shoot(self, target, constraints=(), U0=None, max_it=None,
-                     R_weights=None, **kwargs):
+    # Normalize a constraint argument into a list of expressions:
+    @staticmethod
+    def _as_list(constraints):
 
         # A constraint is any expression g(z, u) <= 0.  Nothing classifies it as
         # an obstacle, a state limit or a control bound, because nothing needs
@@ -33,9 +33,12 @@ class Shooting:
         #   lambda z, u: u[0] - 11.0                                thrust
         #
         if callable(constraints):
-            cons = [constraints]
-        else:
-            cons = list(constraints)
+            return [constraints]
+        return list(constraints)
+
+    # Lambda shoot for optimal control:
+    def lambda_shoot(self, target, constraints=(), U0=None, max_it=None,
+                     R_weights=None, **kwargs):
 
         # Only override the solver's own iteration budget when one was asked
         # for, since a fixed default here is far below what a long horizon needs:
@@ -43,7 +46,8 @@ class Shooting:
             kwargs["max_it"] = max_it
 
         # Run the shoot:
-        return _lambda_shoot(self.system, target, constraints=cons, U0=U0,
+        return _lambda_shoot(self.system, target,
+                             constraints=self._as_list(constraints), U0=U0,
                              R_weights=R_weights, **kwargs)
 
 # Name:
