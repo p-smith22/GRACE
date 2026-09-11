@@ -8,8 +8,9 @@ from scipy.optimize import brentq
 #
 #   g(U)      scalar cost
 #   dinv(v)   inverse marginal map, the U solving grad g(U) = v
-#   M(v)      curvature at that U, either a flat diagonal of length N*nu for a
-#             separable cost or an (N, nu, nu) stack for a coupled one
+#   M(v)      curvature at that U: a flat diagonal of length N*nu for a
+#             separable cost, an (N, nu, nu) stack for one coupled within a
+#             node, or a full (N*nu, N*nu) matrix for one coupled across nodes
 #
 # cost=None selects the quadratic default g(U) = U'U / 2, which is what
 # lambda_shoot minimizes implicitly. Every entry is called with a FLAT vector,
@@ -33,6 +34,10 @@ def _gram_at(system, Co, cost, lam):
     dp = np.asarray(cost[2](Co.T @ lam))
     if dp.ndim == 1:
         return Co @ (dp[:, None] * Co.T)
+
+    # A square dp is a full metric coupling every node, so it contracts directly:
+    if dp.ndim == 2:
+        return Co @ dp @ Co.T
     CoB = Co.reshape(system.m, -1, system.nu)
     return np.einsum("pki,kij,qkj->pq", CoB, dp, CoB)
 

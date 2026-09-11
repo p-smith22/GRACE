@@ -101,57 +101,243 @@ if __name__ == "__main__":
           f"{np.percentile(term_ol, 95):>10.4f}")
 
     # === PLOTS ===
-    mu = Zcl.mean(axis=0)
-    sd = Zcl.std(axis=0)
+
+    # Mean trajectories:
+    mu_cl = Zcl.mean(axis=0)
+    mu_ol = Zol.mean(axis=0)
+
     t = np.arange(system.N + 1) * system.dt
-    fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
 
-    # Trajectory cloud against the nominal and the disc:
-    th = np.linspace(0, 2 * np.pi, 200)
-    ax[0].fill(OBS[0] + R_OBS * np.cos(th), OBS[1] + R_OBS * np.sin(th),
-               color="0.85", zorder=0)
-    for i in range(min(N_TRIALS, 120)):
-        ax[0].plot(Zcl[i, :, 0], Zcl[i, :, 1], "-", color="steelblue",
-                   lw=0.5, alpha=0.15, zorder=1)
-    ax[0].plot(Znom[:, 0], Znom[:, 1], "-", color="crimson", lw=2,
-               label="nominal", zorder=3)
-    ax[0].plot(mu[:, 0], mu[:, 1], "--", color="k", lw=1.3,
-               label="closed-loop mean", zorder=3)
-    ax[0].plot(*TARGET[:2], "*", color="darkgreen", ms=14, zorder=4)
-    ax[0].set_xlabel("x [m]")
-    ax[0].set_ylabel("y [m]")
-    ax[0].set_title("Closed-loop trajectories")
-    ax[0].legend(fontsize=9)
-    ax[0].set_aspect("equal")
-    ax[0].grid(alpha=0.3)
+    # Figure:
+    fig, ax = plt.subplots(
+        1, 3,
+        figsize=(15.5, 4.5),
+    )
 
-    # Tracking error over time, closed loop against open loop:
-    for e, lab, col in [(err_cl, "closed loop", "steelblue"),
-                        (err_ol, "open loop", "darkorange")]:
-        ax[1].plot(t, e.mean(axis=0), "-", color=col, lw=1.8, label=lab)
-        ax[1].fill_between(t, e.mean(axis=0) - 2 * e.std(axis=0),
-                           e.mean(axis=0) + 2 * e.std(axis=0),
-                           color=col, alpha=0.20)
-    ax[1].set_xlabel("time [s]")
-    ax[1].set_ylabel("‖z - z_nom‖")
-    ax[1].set_title("Tracking error, mean ±2σ")
-    ax[1].legend(fontsize=9)
-    ax[1].grid(alpha=0.3)
+    # ============================================================================
+    # 1. MEAN TRAJECTORIES -- OPEN VS CLOSED LOOP
+    # ============================================================================
 
-    # Clearance distribution, with the disc boundary marked:
-    bins = np.linspace(min(clr_ol.min(), clr_cl.min()),
-                       max(clr_ol.max(), clr_cl.max()), 40)
-    ax[2].hist(clr_ol, bins=bins, color="darkorange", alpha=0.6,
-               label="open loop")
-    ax[2].hist(clr_cl, bins=bins, color="steelblue", alpha=0.8,
-               label="closed loop")
-    ax[2].axvline(0.0, color="crimson", ls="--", lw=1.5, label="disc boundary")
-    ax[2].set_xlabel("minimum clearance [m]")
-    ax[2].set_ylabel("trials")
-    ax[2].set_title("Obstacle clearance")
-    ax[2].legend(fontsize=9)
-    ax[2].grid(alpha=0.3, axis="y")
+    th = np.linspace(0, 2 * np.pi, 300)
+
+    # Obstacle:
+    ax[0].fill(
+        OBS[0] + R_OBS * np.cos(th),
+        OBS[1] + R_OBS * np.sin(th),
+        color="0.88",
+        zorder=0,
+    )
+
+    ax[0].plot(
+        OBS[0] + R_OBS * np.cos(th),
+        OBS[1] + R_OBS * np.sin(th),
+        "--",
+        color="0.45",
+        lw=1.2,
+        zorder=1,
+    )
+
+    # A few faint Monte Carlo realizations:
+    n_show = min(N_TRIALS, 50)
+
+    for i in range(n_show):
+        # Open loop trials:
+        ax[0].plot(
+            Zol[i, :, 0],
+            Zol[i, :, 1],
+            color="darkorange",
+            lw=0.5,
+            alpha=0.06,
+            zorder=1,
+        )
+
+        # Closed loop trials:
+        ax[0].plot(
+            Zcl[i, :, 0],
+            Zcl[i, :, 1],
+            color="steelblue",
+            lw=0.5,
+            alpha=0.06,
+            zorder=1,
+        )
+
+    # Nominal trajectory:
+    ax[0].plot(
+        Znom[:, 0],
+        Znom[:, 1],
+        "--",
+        color="0.25",
+        lw=1.8,
+        label="Nominal",
+        zorder=3,
+    )
+
+    # Open-loop mean:
+    ax[0].plot(
+        mu_ol[:, 0],
+        mu_ol[:, 1],
+        "-",
+        color="darkorange",
+        lw=2.8,
+        label="Open-loop mean",
+        zorder=4,
+    )
+
+    # Closed-loop mean:
+    ax[0].plot(
+        mu_cl[:, 0],
+        mu_cl[:, 1],
+        "-",
+        color="steelblue",
+        lw=2.8,
+        label="Closed-loop mean",
+        zorder=5,
+    )
+
+    # Start:
+    ax[0].plot(
+        Znom[0, 0],
+        Znom[0, 1],
+        "o",
+        color="k",
+        ms=6,
+        zorder=6,
+    )
+
+    # Target:
+    ax[0].plot(
+        TARGET[0],
+        TARGET[1],
+        "*",
+        color="darkgreen",
+        ms=15,
+        zorder=6,
+    )
+
+    ax[0].set_xlabel("$x$ [m]")
+    ax[0].set_ylabel("$y$ [m]")
+    ax[0].set_title("Mean Trajectory")
+    ax[0].legend(frameon=False, fontsize=9)
+    ax[0].set_aspect("equal", adjustable="box")
+    ax[0].grid(alpha=0.2)
+
+    # ============================================================================
+    # 2. TRACKING ERROR -- OPEN VS CLOSED LOOP
+    # ============================================================================
+
+    for e, label, color in [
+        (err_cl, "Closed loop", "steelblue"),
+        (err_ol, "Open loop", "darkorange"),
+    ]:
+        mean_e = e.mean(axis=0)
+        std_e = e.std(axis=0)
+
+        ax[1].plot(
+            t,
+            mean_e,
+            color=color,
+            lw=2.2,
+            label=label,
+        )
+
+        ax[1].fill_between(
+            t,
+            np.maximum(mean_e - 2.0 * std_e, 0.0),
+            mean_e + 2.0 * std_e,
+            color=color,
+            alpha=0.15,
+        )
+
+    ax[1].set_xlabel("Time [s]")
+    ax[1].set_ylabel(r"$\|z-z_{\mathrm{nom}}\|$")
+    ax[1].set_title(r"Tracking Error: Mean $\pm 2\sigma$")
+    ax[1].legend(frameon=False, fontsize=9)
+    ax[1].grid(alpha=0.2)
+
+    # ============================================================================
+    # 3. TERMINAL POSITION CLOUD
+    # ============================================================================
+
+    # Obstacle for spatial context:
+    ax[2].fill(
+        OBS[0] + R_OBS * np.cos(th),
+        OBS[1] + R_OBS * np.sin(th),
+        color="0.88",
+        zorder=0,
+    )
+
+    # Terminal points:
+    ax[2].scatter(
+        Zol[:, -1, 0],
+        Zol[:, -1, 1],
+        s=15,
+        color="darkorange",
+        alpha=0.30,
+        label="Open loop",
+    )
+
+    ax[2].scatter(
+        Zcl[:, -1, 0],
+        Zcl[:, -1, 1],
+        s=15,
+        color="steelblue",
+        alpha=0.40,
+        label="Closed loop",
+    )
+
+    # Mean terminal positions:
+    ax[2].plot(
+        mu_ol[-1, 0],
+        mu_ol[-1, 1],
+        "o",
+        color="darkorange",
+        ms=9,
+        markeredgecolor="k",
+        markeredgewidth=0.7,
+    )
+
+    ax[2].plot(
+        mu_cl[-1, 0],
+        mu_cl[-1, 1],
+        "o",
+        color="steelblue",
+        ms=9,
+        markeredgecolor="k",
+        markeredgewidth=0.7,
+    )
+
+    # Desired target:
+    ax[2].plot(
+        TARGET[0],
+        TARGET[1],
+        "*",
+        color="darkgreen",
+        ms=15,
+        label="Target",
+        zorder=5,
+    )
+
+    ax[2].set_xlabel("$x$ [m]")
+    ax[2].set_ylabel("$y$ [m]")
+    ax[2].set_title("Terminal Position")
+    ax[2].legend(frameon=False, fontsize=9)
+    ax[2].set_aspect("equal", adjustable="box")
+    ax[2].grid(alpha=0.2)
+
+    # ============================================================================
+    # CLEANUP
+    # ============================================================================
+
+    for a in ax:
+        a.spines["top"].set_visible(False)
+        a.spines["right"].set_visible(False)
 
     fig.tight_layout()
-    fig.savefig("figures/tests/lqr_mc.png", dpi=140, bbox_inches="tight")
+
+    fig.savefig(
+        "figures/tests/lqr_mc.png",
+        dpi=180,
+        bbox_inches="tight",
+    )
+
     print("\nsaved figures/tests/lqr_mc.png")

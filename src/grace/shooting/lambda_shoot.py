@@ -184,12 +184,37 @@ def _break_symmetry(system, con, U, n_dof, rounds=6):
             return U
     return U
 
-# Apply an inverse-Hessian metric, diagonal or block diagonal, to a vector or matrix:
+# Finite-difference the inverse marginal map one column at a time. A single
+# simultaneous perturbation only recovers the diagonal when dinv is separable,
+# so a coupled cost needs the full square Jacobian:
+def _fd_metric(f_dinv, s):
+
+    n = s.size
+    J = np.empty((n, n))
+    for j in range(n):
+        h = 1e-6 * (1.0 + abs(float(s[j])))
+        e = np.zeros(n)
+        e[j] = h
+        J[:, j] = (np.asarray(f_dinv(s + e)).ravel()
+                   - np.asarray(f_dinv(s - e)).ravel()) / (2.0 * h)
+
+    # Symmetrize, since the metric is the inverse of a Hessian:
+    J = 0.5 * (J + J.T)
+
+    # Collapse to a diagonal when nothing off it survives, keeping the cheap path:
+    off = np.abs(J - np.diag(np.diag(J))).max()
+    return np.diag(J) if off <= 1e-9 * max(1.0, np.abs(J).max()) else J
+
+# Apply an inverse-Hessian metric, diagonal, block diagonal or full, to a vector or matrix:
 def _apply_metric(dp, V, nu):
 
     # A flat dp is a diagonal metric, so it multiplies elementwise:
     if dp.ndim == 1:
         return dp[:, None] * V if V.ndim > 1 else dp * V
+
+    # A square dp couples every node, so it applies as a plain matrix product:
+    if dp.ndim == 2:
+        return dp @ V
 
     # A block dp couples the controls within a node but not across nodes:
     W = V if V.ndim > 1 else V[:, None]
@@ -464,13 +489,14 @@ def lambda_shoot(system, z_target, constraints=(), U0=None, R_weights=None,
                         if f_dprime is not None:
                             dp = np.asarray(f_dprime(s_))
                         else:
-                            h_ = 1e-6 * (1.0 + np.abs(s_))
-                            dp = (f_dinv(s_ + h_)
-                                  - f_dinv(s_ - h_)) / (2.0 * h_)
+                            dp = _fd_metric(f_dinv, s_)
 
-                        # Flat dp is a diagonal M, (N,nu,nu) dp a block diagonal one:
+                        # Flat dp is a diagonal M, (N,nu,nu) a block diagonal one,
+                        # (N*nu,N*nu) a full one coupling across nodes:
                         if dp.ndim == 1:
                             return Co @ (dp[:, None] * Co.T)
+                        if dp.ndim == 2:
+                            return Co @ dp @ Co.T
                         CoB = Co.reshape(m, -1, system.nu)
                         return np.einsum("pki,kij,qkj->pq", CoB, dp, CoB)
 
